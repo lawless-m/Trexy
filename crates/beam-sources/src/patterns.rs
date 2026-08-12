@@ -5,7 +5,7 @@
 
 use std::f32::consts::TAU;
 
-use beam_trace::{Trace, TraceHeader};
+use beam_trace::{Sample, Trace, TraceHeader};
 
 use crate::lissajous::Lissajous;
 use crate::pen::Pen;
@@ -81,7 +81,8 @@ pub const PATTERNS: [Pattern; 7] = [
         slug: "lissajous-torture",
         isolates: "overall stability",
         seconds: 1.0,
-        refresh_hz: 25.0,
+        // The figure takes 40 ms; the rest of the frame is flyback and idle.
+        refresh_hz: 20.0,
     },
 ];
 
@@ -94,22 +95,44 @@ impl Pattern {
         format!("synthetic/{}", self.slug)
     }
 
-    /// Generate the fixture.
-    pub fn build(&self) -> Trace {
-        let mut pen = Pen::new(HOME, EPSILON);
+    /// One frame of the program: the display list, then the idle to the
+    /// refresh boundary.
+    ///
+    /// A machine that finishes its display list early sits dark until its
+    /// frame interrupt, and that idle is exactly what the phosphor decays
+    /// through. Every frame starts and ends at [`HOME`], so frames tile.
+    pub fn frame(&self) -> (Vec<Sample>, f32) {
         let frame_seconds = 1.0 / self.refresh_hz;
+        let mut pen = Pen::new(HOME, EPSILON);
+        self.draw(&mut pen);
+        assert!(
+            pen.now() <= frame_seconds,
+            "{} draws for {} s but its refresh interval is {frame_seconds} s; \
+             frames would overlap and timestamps would stop increasing",
+            self.slug,
+            pen.now(),
+        );
+        pen.park([0.0; 3], frame_seconds - pen.now());
+        (pen.into_samples(), frame_seconds)
+    }
+
+    /// Generate the fixture: one frame, repeated.
+    pub fn build(&self) -> Trace {
+        let (frame, frame_seconds) = self.frame();
         let frames = (self.seconds * self.refresh_hz).round().max(1.0) as usize;
 
-        for _ in 0..frames {
-            let started = pen.now();
-            self.draw(&mut pen);
-
-            // Wait for the next refresh, dark. A machine that finishes its
-            // display list early sits idle until its frame interrupt, and that
-            // idle time is exactly what the phosphor decays through.
-            let next = started + frame_seconds;
-            if pen.now() < next {
-                pen.park([0.0; 3], next - pen.now());
+        let mut samples: Vec<Sample> = Vec::with_capacity(frame.len() * frames);
+        for repeat in 0..frames {
+            let offset = repeat as f32 * frame_seconds;
+            for (index, sample) in frame.iter().enumerate() {
+                // The opening sample only re-states where the beam already is.
+                if repeat > 0 && index == 0 {
+                    continue;
+                }
+                samples.push(Sample {
+                    t: sample.t + offset,
+                    ..*sample
+                });
             }
         }
 
@@ -120,7 +143,7 @@ impl Pattern {
                 nominal_refresh_hz: self.refresh_hz,
                 producer_id: self.producer_id(),
             },
-            samples: pen.into_samples(),
+            samples,
         }
     }
 

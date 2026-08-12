@@ -120,6 +120,22 @@ impl RingBuffer {
         self.slices(lo, hi - lo)
     }
 
+    /// Every sample needed to reconstruct the spans overlapping `[from, to]`.
+    ///
+    /// This is [`Self::samples_in`] plus the sample at or before `from`. The
+    /// renderer asks for a window of *time*, but it draws *spans*, and a span
+    /// that straddles the start of the window needs the sample before it too —
+    /// without which the first stroke of every frame would be dropped.
+    pub fn spans_in(&self, from: f32, to: f32) -> (&[Sample], &[Sample]) {
+        let after = self.first_index_after(from);
+        let lo = after.saturating_sub(1);
+        let hi = self.first_index_after(to);
+        if hi <= lo {
+            return (&[], &[]);
+        }
+        self.slices(lo, hi - lo)
+    }
+
     /// Logical index of the first sample with `t > bound`, or `len` if none.
     fn first_index_after(&self, bound: f32) -> usize {
         let (mut lo, mut hi) = (0usize, self.len);
@@ -194,6 +210,23 @@ mod tests {
         assert_eq!(a.len(), 2, "first run reaches the end of the backing store");
         assert_eq!(b.len(), 2, "second run wraps to the start");
         assert_eq!(window(&ring, 0.0, 10.0), vec![3.0, 4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn a_span_query_includes_the_sample_before_the_window() {
+        let mut ring = RingBuffer::with_capacity(8, 0.0);
+        ring.extend(&[at(1.0), at(2.0), at(3.0), at(4.0), at(5.0)]);
+
+        // The sample window excludes 2.0; the span window keeps it, because
+        // the span 2.0 -> 3.0 overlaps the requested time.
+        let (a, b) = ring.spans_in(2.0, 4.0);
+        let ts: Vec<f32> = a.iter().chain(b.iter()).map(|s| s.t).collect();
+        assert_eq!(ts, vec![2.0, 3.0, 4.0]);
+
+        // Nothing before the first sample to include.
+        let (a, b) = ring.spans_in(0.0, 2.0);
+        let ts: Vec<f32> = a.iter().chain(b.iter()).map(|s| s.t).collect();
+        assert_eq!(ts, vec![1.0, 2.0]);
     }
 
     #[test]

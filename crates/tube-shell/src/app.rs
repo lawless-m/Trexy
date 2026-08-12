@@ -14,15 +14,11 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId};
 
 use crate::gpu;
-use crate::headless::hardcoded_spans;
 use crate::render::DISPLAY_HEIGHT;
 use crate::shaders::{ShaderLibrary, shader_dir};
+use crate::source::{Controls, LiveSource, Source};
 
 const PRESENT_SHADER: &str = "present.wgsl";
-
-/// The debug spans run to here; the shell replays them once per rebuild until
-/// live sources arrive.
-const TRACE_END: f64 = 0.007;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -58,6 +54,8 @@ struct Gpu {
     splat: bool,
     view: View,
     timings: Timings,
+    /// Samples pulled from the ring for the last frame, for the panel.
+    window_samples: usize,
 
     egui_ctx: egui::Context,
     egui_state: egui_winit::State,
@@ -66,6 +64,7 @@ struct Gpu {
 
 pub struct App {
     gpu: Option<Gpu>,
+    source: LiveSource,
     shaders: ShaderLibrary,
     shader_dir: PathBuf,
     /// Held for its lifetime: dropping the watcher stops the notifications.
@@ -98,6 +97,7 @@ impl App {
 
         Self {
             gpu: None,
+            source: LiveSource::spawn(),
             shaders,
             shader_dir: dir,
             _watcher: watcher,
@@ -140,7 +140,7 @@ impl ApplicationHandler for App {
         }
         match Gpu::new(event_loop) {
             Ok(mut gpu) => {
-                gpu.rebuild(&self.shaders);
+                gpu.rebuild(&self.shaders, &self.source);
                 self.gpu = Some(gpu);
             }
             Err(e) => {
@@ -164,7 +164,7 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => gpu.resize(size.width, size.height),
-            WindowEvent::RedrawRequested => gpu.redraw(&self.shaders),
+            WindowEvent::RedrawRequested => gpu.redraw(&self.shaders, &self.source),
             _ => {}
         }
     }
@@ -173,7 +173,7 @@ impl ApplicationHandler for App {
         let changed = self.poll_shader_changes();
         if let Some(gpu) = &mut self.gpu {
             if changed {
-                gpu.rebuild(&self.shaders);
+                gpu.rebuild(&self.shaders, &self.source);
             }
             gpu.window.request_redraw();
         }
@@ -294,6 +294,7 @@ impl Gpu {
             splat: false,
             view: View::default(),
             timings: Timings::default(),
+            window_samples: 0,
             egui_ctx,
             egui_state,
             egui_renderer,
@@ -320,7 +321,7 @@ impl Gpu {
     /// Rebuild the whole chain from the library's installed sources and replay
     /// the debug spans once. If the library has nothing valid, whatever is
     /// already running is left alone — that is "keep the last good pipeline".
-    fn rebuild(&mut self, shaders: &ShaderLibrary) {
+    fn rebuild(&mut self, shaders: &ShaderLibrary, live: &LiveSource) {
         if self.rendered_generation == Some(shaders.generation()) {
             return;
         }
@@ -365,16 +366,11 @@ impl Gpu {
                 view: source("view.wgsl").expect("checked"),
                 sample_points: source("sample_points.wgsl").expect("checked"),
             },
-            0.0,
+            // The field picks up from the present, not from the start of the
+            // session: a shader edit must not replay the whole history.
+            live.elapsed(),
         );
         field.clear(&self.device, &self.queue);
-        field.advance(
-            &self.device,
-            &self.queue,
-            &hardcoded_spans(),
-            TRACE_END,
-            self.mode(),
-        );
 
         let module = self
             .device
@@ -444,23 +440,6 @@ impl Gpu {
         self.rendered_generation = Some(shaders.generation());
     }
 
-    /// Redraw the field from scratch after a debug toggle changed what it
-    /// should contain.
-    fn redeposit(&mut self) {
-        let mode = self.mode();
-        let Some(rendered) = &mut self.rendered else {
-            return;
-        };
-        rendered.field.clear(&self.device, &self.queue);
-        rendered.field.advance(
-            &self.device,
-            &self.queue,
-            &hardcoded_spans(),
-            TRACE_END,
-            mode,
-        );
-    }
-
     /// Letterbox the tube face into the window without distorting it.
     fn present_uniform(&self, rendered: &Rendered) -> PresentUniform {
         let tube = rendered.field.output_width() as f32 / rendered.field.output_height() as f32;
@@ -478,7 +457,7 @@ impl Gpu {
         }
     }
 
-    fn redraw(&mut self, shaders: &ShaderLibrary) {
+    fn redraw(&mut self, shaders: &ShaderLibrary, source: &LiveSource) {
         use wgpu::CurrentSurfaceTexture as Acquired;
         let frame = match self.surface.get_current_texture() {
             Acquired::Success(frame) => frame,
@@ -502,6 +481,7 @@ impl Gpu {
 
         // Run the readout chain for the selected view.
         let selected = self.view;
+        let mode = self.mode();
         let uniform = self
             .rendered
             .as_ref()
@@ -511,23 +491,27 @@ impl Gpu {
                 .write_buffer(&self.present_buffer, 0, bytemuck::bytes_of(&uniform));
         }
         if let Some(rendered) = &mut self.rendered {
-            self.timings =
-                rendered
-                    .field
-                    .render(&self.device, &self.queue, selected, &hardcoded_spans());
+            // Ask the ring buffer for everything since the field last caught
+            // up, and let the substep loop chop it (TRACE-FORMAT.md §5).
+            let now = source.elapsed();
+            let window = source.window(rendered.field.simulated() as f32, now as f32);
+            rendered
+                .field
+                .advance(&self.device, &self.queue, &window, now, mode);
+            self.timings = rendered
+                .field
+                .render(&self.device, &self.queue, selected, &window);
+            self.window_samples = window.len();
         }
 
         let raw_input = self.egui_state.take_egui_input(&self.window);
         let mut splat = self.splat;
         let mut chosen = self.view;
         let output = self.egui_ctx.clone().run_ui(raw_input, |ui| {
-            self.panel(ui, shaders, &mut splat, &mut chosen);
+            self.panel(ui, shaders, source, &mut splat, &mut chosen);
         });
         self.view = chosen;
-        if splat != self.splat {
-            self.splat = splat;
-            self.redeposit();
-        }
+        self.splat = splat;
         self.egui_state
             .handle_platform_output(&self.window, output.platform_output);
         let paint_jobs = self
@@ -594,7 +578,14 @@ impl Gpu {
         }
     }
 
-    fn panel(&self, ui: &mut egui::Ui, shaders: &ShaderLibrary, splat: &mut bool, view: &mut View) {
+    fn panel(
+        &self,
+        ui: &mut egui::Ui,
+        shaders: &ShaderLibrary,
+        source: &LiveSource,
+        splat: &mut bool,
+        view: &mut View,
+    ) {
         egui::Panel::left("shell").show(ui, |ui| {
             ui.heading("Trexy");
             ui.label(format!(
@@ -603,12 +594,16 @@ impl Gpu {
             ));
             ui.separator();
 
+            source_controls(ui, source);
+            ui.separator();
+
             ui.label("view");
             for candidate in View::ALL {
                 ui.radio_value(view, candidate, candidate.name());
             }
             ui.separator();
 
+            ui.label(format!("{} samples this frame", self.window_samples));
             if let Some(rendered) = &self.rendered {
                 ui.label(format!(
                     "field {}×{} → {}×{}",
@@ -668,4 +663,54 @@ impl Gpu {
             self.timings.readout_total_micros()
         ));
     }
+}
+
+/// Source selection and the live Lissajous controls.
+///
+/// Every one of these takes effect on the next chunk the producer emits, with
+/// no restart: the producer reads the controls at the top of each iteration
+/// (FIRST-SLICE.md §1 deliverable 4).
+fn source_controls(ui: &mut egui::Ui, source: &LiveSource) {
+    let mut controls = source.controls();
+    let before = controls;
+
+    ui.label("source");
+    egui::ComboBox::from_id_salt("source")
+        .selected_text(controls.source.name())
+        .show_ui(ui, |ui| {
+            ui.selectable_value(&mut controls.source, Source::Lissajous, "lissajous");
+            for (index, pattern) in beam_sources::PATTERNS.iter().enumerate() {
+                ui.selectable_value(
+                    &mut controls.source,
+                    Source::Pattern(index),
+                    format!("{}. {}", pattern.number, pattern.slug),
+                );
+            }
+        });
+
+    if controls.source == Source::Lissajous {
+        let figure = &mut controls.lissajous;
+        ui.add(egui::Slider::new(&mut figure.freq_x, 1.0..=13.0).text("freq x"));
+        ui.add(egui::Slider::new(&mut figure.freq_y, 1.0..=13.0).text("freq y"));
+        ui.add(egui::Slider::new(&mut figure.phase, 0.0..=std::f32::consts::TAU).text("phase"));
+        ui.add(egui::Slider::new(&mut figure.drive, 0.0..=4.0).text("drive"));
+        ui.add(egui::Slider::new(&mut figure.speed, 1.0..=60.0).text("speed"));
+        ui.add(egui::Slider::new(&mut figure.amplitude, 0.1..=1.0).text("amplitude"));
+    } else if let Source::Pattern(index) = controls.source {
+        ui.label(beam_sources::PATTERNS[index].isolates);
+    }
+
+    ui.label(format!("{} samples buffered", source.buffered()));
+
+    if controls.source != before.source {
+        // A different program: tell the producer to drop what it queued.
+        controls.generation = controls.generation.wrapping_add(1);
+    }
+    if !matches_controls(&controls, &before) {
+        source.set_controls(controls);
+    }
+}
+
+fn matches_controls(a: &Controls, b: &Controls) -> bool {
+    a.source == b.source && a.lissajous == b.lissajous && a.generation == b.generation
 }

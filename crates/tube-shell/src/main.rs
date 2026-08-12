@@ -5,6 +5,7 @@ mod gpu;
 mod headless;
 mod render;
 mod shaders;
+mod source;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
