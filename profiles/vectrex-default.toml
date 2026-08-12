@@ -1,0 +1,40 @@
+name = "vectrex-default"
+description = 'The Vectrex 9" Samsung tube, as specified in RENDERER.md §4. Fitted values are starting guesses to be tuned against the patterns.'
+supersample = 2
+substep_seconds = 0.00125
+
+[profile]
+aspect_w = 3.0
+aspect_h = 4.0
+
+[deposit]
+sigma0 = 0.0015
+sigma1 = 0.0025
+gamma_s = 0.7
+
+[phosphor]
+e_sat = 4.0
+tau_fast = 0.00012
+tau_slow = 0.04
+fast_split = 0.75
+
+[readout]
+chroma_fast = [
+    0.85,
+    0.95,
+    1.0,
+]
+chroma_slow = [
+    1.0,
+    0.92,
+    0.7,
+]
+glow_tight_sigma = 0.004
+glow_halo_sigma = 0.06
+glow_halo_gain = 0.08
+pincushion = 0.02
+rotation = 0.0
+overscan = 1.0
+vignette = 0.25
+reflection = 0.01
+exposure = 1.0

@@ -7,7 +7,10 @@ use std::sync::mpsc::{Receiver, channel};
 
 use bytemuck::{Pod, Zeroable};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
-use tube_renderer::{DepositMode, Field, FieldShaders, READOUT_PASSES, Timings, TubeParams, View};
+use tube_renderer::{
+    Class, DepositMode, Field, FieldShaders, Profile, READOUT_PASSES, Timings, TubeParams, View,
+    registry,
+};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -26,6 +29,15 @@ struct PresentUniform {
     fit: [f32; 2],
     exposure: f32,
     _pad: f32,
+}
+
+/// What the panel may change in a frame. Gathered so the call site does not
+/// grow an argument per control.
+struct PanelState<'a> {
+    splat: &'a mut bool,
+    view: &'a mut View,
+    params: &'a mut TubeParams,
+    status: &'a mut String,
 }
 
 /// Everything rebuilt when a shader changes. Held as a unit so a failed
@@ -56,6 +68,11 @@ struct Gpu {
     timings: Timings,
     /// Samples pulled from the ring for the last frame, for the panel.
     window_samples: usize,
+    params: TubeParams,
+    /// What the current buffers were built with, so a structural change is
+    /// noticed and rebuilt rather than silently ignored.
+    built_with: TubeParams,
+    profile_status: String,
 
     egui_ctx: egui::Context,
     egui_state: egui_winit::State,
@@ -295,6 +312,9 @@ impl Gpu {
             view: View::default(),
             timings: Timings::default(),
             window_samples: 0,
+            params: TubeParams::default(),
+            built_with: TubeParams::default(),
+            profile_status: String::new(),
             egui_ctx,
             egui_state,
             egui_renderer,
@@ -322,7 +342,8 @@ impl Gpu {
     /// the debug spans once. If the library has nothing valid, whatever is
     /// already running is left alone — that is "keep the last good pipeline".
     fn rebuild(&mut self, shaders: &ShaderLibrary, live: &LiveSource) {
-        if self.rendered_generation == Some(shaders.generation()) {
+        let structural = self.params.needs_rebuild(&self.built_with);
+        if self.rendered_generation == Some(shaders.generation()) && !structural {
             return;
         }
         let source = |name: &str| shaders.get(name);
@@ -353,7 +374,7 @@ impl Gpu {
             &self.device,
             &self.queue,
             DISPLAY_HEIGHT,
-            TubeParams::default(),
+            self.params,
             FieldShaders {
                 deposit: source("deposit.wgsl").expect("checked"),
                 splat: source("deposit_splat.wgsl").expect("checked"),
@@ -438,6 +459,7 @@ impl Gpu {
             bind_group,
         });
         self.rendered_generation = Some(shaders.generation());
+        self.built_with = self.params;
     }
 
     /// Letterbox the tube face into the window without distorting it.
@@ -490,7 +512,9 @@ impl Gpu {
             self.queue
                 .write_buffer(&self.present_buffer, 0, bytemuck::bytes_of(&uniform));
         }
+        let params = self.params;
         if let Some(rendered) = &mut self.rendered {
+            rendered.field.set_params(params);
             // Ask the ring buffer for everything since the field last caught
             // up, and let the substep loop chop it (TRACE-FORMAT.md §5).
             let now = source.elapsed();
@@ -507,11 +531,25 @@ impl Gpu {
         let raw_input = self.egui_state.take_egui_input(&self.window);
         let mut splat = self.splat;
         let mut chosen = self.view;
+        let mut params = self.params;
+        let mut status = self.profile_status.clone();
         let output = self.egui_ctx.clone().run_ui(raw_input, |ui| {
-            self.panel(ui, shaders, source, &mut splat, &mut chosen);
+            self.panel(
+                ui,
+                shaders,
+                source,
+                &mut PanelState {
+                    splat: &mut splat,
+                    view: &mut chosen,
+                    params: &mut params,
+                    status: &mut status,
+                },
+            );
         });
         self.view = chosen;
         self.splat = splat;
+        self.params = params;
+        self.profile_status = status;
         self.egui_state
             .handle_platform_output(&self.window, output.platform_output);
         let paint_jobs = self
@@ -583,9 +621,12 @@ impl Gpu {
         ui: &mut egui::Ui,
         shaders: &ShaderLibrary,
         source: &LiveSource,
-        splat: &mut bool,
-        view: &mut View,
+        state: &mut PanelState<'_>,
     ) {
+        let splat = &mut *state.splat;
+        let view = &mut *state.view;
+        let params = &mut *state.params;
+        let status = &mut *state.status;
         egui::Panel::left("shell").show(ui, |ui| {
             ui.heading("Trexy");
             ui.label(format!(
@@ -625,6 +666,9 @@ impl Gpu {
                     "forbidden path — beading reference only",
                 );
             }
+            ui.separator();
+
+            parameter_panel(ui, params, status);
             ui.separator();
 
             ui.label(format!("shaders: generation {}", shaders.generation()));
@@ -713,4 +757,79 @@ fn source_controls(ui: &mut egui::Ui, source: &LiveSource) {
 
 fn matches_controls(a: &Controls, b: &Controls) -> bool {
     a.source == b.source && a.lissajous == b.lissajous && a.generation == b.generation
+}
+
+/// Every RENDERER.md §4 parameter, grouped by provenance class.
+///
+/// The grouping is the point. ARCHITECTURE.md §4 says the split between
+/// physics and taste *is* the accuracy claim, and a claim nobody can see is
+/// not a claim at all — so the class headings are the primary structure here,
+/// not an afterthought in a tooltip.
+fn parameter_panel(ui: &mut egui::Ui, params: &mut TubeParams, status: &mut String) {
+    ui.label("parameters");
+    ui.horizontal(|ui| {
+        if ui.button("vectrex-default").clicked() {
+            *params = tube_renderer::vectrex_default().params;
+            *status = "loaded built-in vectrex-default".to_owned();
+        }
+        if ui.button("neutral").clicked() {
+            *params = tube_renderer::neutral().params;
+            *status = "loaded built-in neutral".to_owned();
+        }
+    });
+    ui.horizontal(|ui| {
+        if ui.button("load profiles/…").clicked() {
+            *status = match Profile::load("profiles/vectrex-default.toml") {
+                Ok(profile) => {
+                    *params = profile.params;
+                    format!("loaded {}", profile.name)
+                }
+                Err(e) => e,
+            };
+        }
+        if ui.button("save profiles/current.toml").clicked() {
+            let profile = Profile::new("current", "saved from the panel", *params);
+            *status = match profile.save("profiles/current.toml") {
+                Ok(()) => "wrote profiles/current.toml".to_owned(),
+                Err(e) => e,
+            };
+        }
+    });
+    if !status.is_empty() {
+        ui.label(egui::RichText::new(status.as_str()).small());
+    }
+
+    let specs = registry();
+    for class in Class::ALL {
+        let in_class: Vec<_> = specs.iter().filter(|spec| spec.class == class).collect();
+        if in_class.is_empty() {
+            continue;
+        }
+        egui::CollapsingHeader::new(format!("{} — {}", class.name(), class.meaning()))
+            .default_open(class == Class::Fitted)
+            .show(ui, |ui| {
+                for spec in in_class {
+                    ui.horizontal(|ui| {
+                        let mut value = spec.get(params);
+                        let slider = egui::Slider::new(&mut value, spec.min..=spec.max)
+                            .text(spec.name)
+                            .max_decimals(6);
+                        if ui.add(slider).changed() {
+                            spec.set(params, value);
+                        }
+                        // Per-parameter reset, so a slider dragged out of
+                        // shape does not cost the whole set.
+                        let changed = (spec.get(params) - spec.default()).abs() > f32::EPSILON;
+                        if ui
+                            .add_enabled(changed, egui::Button::new("↺"))
+                            .on_hover_text(format!("reset to {}", spec.default()))
+                            .clicked()
+                        {
+                            spec.reset(params);
+                        }
+                    });
+                    ui.label(egui::RichText::new(spec.note).small().weak());
+                }
+            });
+    }
 }

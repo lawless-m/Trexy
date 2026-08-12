@@ -30,7 +30,8 @@ const BLUR_REACH_SIGMAS: f32 = 3.0;
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
 /// Readout, optics and tonemap parameters (RENDERER.md §4).
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct ReadoutParams {
     /// Fast component chromaticity — blue-ish. Fitted.
     pub chroma_fast: [f32; 3],
@@ -194,7 +195,10 @@ struct BlurPass {
     view: wgpu::TextureView,
     bind_group: wgpu::BindGroup,
     uniform: wgpu::Buffer,
-    step: [f32; 2],
+    /// Which σ this axis uses, so the tap spacing follows a live slider
+    /// rather than being frozen at construction.
+    halo: bool,
+    horizontal: bool,
 }
 
 pub struct Readout {
@@ -358,16 +362,6 @@ impl Readout {
             })
         };
 
-        // σ is in face units — one unit is half the tube height — so it becomes
-        // texels with the y scale, and UV per axis from there.
-        let sigma_uv = |sigma: f32| {
-            let texels = sigma * height as f32 / 2.0;
-            [texels / width as f32, texels / height as f32]
-        };
-        let spacing = BLUR_REACH_SIGMAS / BLUR_RADIUS;
-        let tight = sigma_uv(params.glow_tight_sigma);
-        let wide = sigma_uv(params.glow_halo_sigma);
-
         let uniforms: [wgpu::Buffer; 4] =
             std::array::from_fn(|i| uniform_buffer::<GpuBlur>(device, &format!("blur[{i}]")));
         let blurs = [
@@ -375,25 +369,29 @@ impl Readout {
                 view: view(&scatter_h),
                 bind_group: blur_bind_group(&readout, &uniforms[0]),
                 uniform: uniforms[0].clone(),
-                step: [tight[0] * spacing, 0.0],
+                halo: false,
+                horizontal: true,
             },
             BlurPass {
                 view: view(&scatter),
                 bind_group: blur_bind_group(&scatter_h, &uniforms[1]),
                 uniform: uniforms[1].clone(),
-                step: [0.0, tight[1] * spacing],
+                halo: false,
+                horizontal: false,
             },
             BlurPass {
                 view: view(&halo_h),
                 bind_group: blur_bind_group(&readout, &uniforms[2]),
                 uniform: uniforms[2].clone(),
-                step: [wide[0] * spacing, 0.0],
+                halo: true,
+                horizontal: true,
             },
             BlurPass {
                 view: view(&halo),
                 bind_group: blur_bind_group(&halo_h, &uniforms[3]),
                 uniform: uniforms[3].clone(),
-                step: [0.0, wide[1] * spacing],
+                halo: true,
+                horizontal: false,
             },
         ];
 
@@ -569,6 +567,29 @@ impl Readout {
         self.params
     }
 
+    /// Chromaticities, glow σ, geometry, glass and exposure all feed uniforms
+    /// written every frame, so they change live.
+    pub fn set_params(&mut self, params: ReadoutParams) {
+        self.params = params;
+    }
+
+    /// σ is in face units — one unit is half the tube height — so it becomes
+    /// texels with the y scale, and UV per axis from there.
+    fn blur_step(&self, blur: &BlurPass) -> [f32; 2] {
+        let sigma = if blur.halo {
+            self.params.glow_halo_sigma
+        } else {
+            self.params.glow_tight_sigma
+        };
+        let texels = sigma * self.height as f32 / 2.0;
+        let spacing = BLUR_REACH_SIGMAS / BLUR_RADIUS;
+        if blur.horizontal {
+            [texels / self.width as f32 * spacing, 0.0]
+        } else {
+            [0.0, texels / self.height as f32 * spacing]
+        }
+    }
+
     /// Run the whole chain: combine, scatter, halo, then either the tonemap or
     /// a debug view, and optionally the sample-point overlay on top.
     ///
@@ -722,7 +743,7 @@ impl Readout {
                 &blur.uniform,
                 0,
                 bytemuck::bytes_of(&GpuBlur {
-                    step: blur.step,
+                    step: self.blur_step(blur),
                     _pad: [0.0, 0.0],
                 }),
             );

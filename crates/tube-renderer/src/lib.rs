@@ -5,6 +5,7 @@
 
 pub mod deposit;
 pub mod frame;
+pub mod params;
 pub mod phosphor;
 mod readback;
 pub mod readout;
@@ -13,6 +14,7 @@ pub mod timing;
 
 pub use deposit::{Deposit, DepositMode, DepositParams, DepositShaders, SUPERSAMPLE, TubeProfile};
 pub use frame::{Field, FieldShaders, TubeParams};
+pub use params::{Class, ParamSpec, Profile, TABLE_ROWS, neutral, registry, vectrex_default};
 pub use phosphor::{Component, Phosphor, PhosphorParams};
 pub use readout::{Readout, ReadoutParams, ReadoutShaders, View};
 pub use substep::{SUBSTEP_SECONDS, Substep, SubstepClock, clip_spans};

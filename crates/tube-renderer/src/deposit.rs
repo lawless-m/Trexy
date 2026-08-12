@@ -23,7 +23,8 @@ const WORKGROUP: u32 = 8;
 
 /// Tube face geometry. Aspect belongs to the tube, not the producer and not
 /// the window (TRACE-FORMAT.md §1).
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct TubeProfile {
     pub aspect_w: f32,
     pub aspect_h: f32,
@@ -45,7 +46,8 @@ impl Default for TubeProfile {
 
 /// Spot-shape parameters. All fitted class (RENDERER.md §4) — starting
 /// guesses, to be tuned against the acceptance patterns.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct DepositParams {
     /// σ0 — parked dim dot width, in deflection units.
     pub sigma0: f32,
@@ -157,11 +159,12 @@ impl Deposit {
     pub fn new(
         device: &wgpu::Device,
         display_height: u32,
+        supersample: u32,
         profile: TubeProfile,
         params: DepositParams,
         shaders: DepositShaders<'_>,
     ) -> Self {
-        let height = (display_height * SUPERSAMPLE).max(1);
+        let height = (display_height * supersample.max(1)).max(1);
         let width = ((height as f32 * profile.aspect_w / profile.aspect_h).round() as u32).max(1);
 
         let scratch = device.create_texture(&wgpu::TextureDescriptor {
@@ -311,6 +314,11 @@ impl Deposit {
         self.height
     }
 
+    /// Spot parameters feed a uniform, so they change without rebuilding.
+    pub fn set_params(&mut self, params: DepositParams) {
+        self.params = params;
+    }
+
     pub fn scratch_view(&self) -> &wgpu::TextureView {
         &self.scratch_view
     }
@@ -329,6 +337,19 @@ impl Deposit {
     ) {
         let dispatches = self.plan(samples);
         self.upload(device, queue, samples, &dispatches);
+        queue.write_buffer(
+            &self.params_buffer,
+            0,
+            bytemuck::bytes_of(&GpuParams {
+                resolution: [self.width, self.height],
+                scale_x: self.width as f32 / 2.0,
+                scale_y: self.height as f32 / 2.0,
+                sigma0: self.params.sigma0,
+                sigma1: self.params.sigma1,
+                gamma_s: self.params.gamma_s,
+                _pad: 0.0,
+            }),
+        );
 
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("deposit"),

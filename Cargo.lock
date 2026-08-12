@@ -2597,6 +2597,8 @@ version = "0.1.0"
 dependencies = [
  "beam-trace",
  "bytemuck",
+ "serde",
+ "toml",
  "wgpu",
 ]
 

@@ -24,6 +24,7 @@ pub struct RenderOptions {
     pub sim_seconds: Option<f64>,
     pub frame_hz: f64,
     pub view: View,
+    pub params: TubeParams,
 }
 
 pub fn render(options: &RenderOptions) -> Result<(), String> {
@@ -47,7 +48,7 @@ pub fn render(options: &RenderOptions) -> Result<(), String> {
         &device,
         &queue,
         DISPLAY_HEIGHT,
-        TubeParams::default(),
+        options.params,
         FieldShaders {
             deposit: source("deposit.wgsl")?,
             splat: source("deposit_splat.wgsl")?,

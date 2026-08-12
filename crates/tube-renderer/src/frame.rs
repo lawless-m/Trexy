@@ -10,12 +10,40 @@ use crate::timing::Timings;
 
 /// Every parameter the tube model takes, grouped by the pass that owns it.
 /// The provenance classes live on the individual structs (ARCHITECTURE.md §4).
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct TubeParams {
+    /// Deposit resolution as a multiple of the display resolution. A quality
+    /// tier, not a physical claim; changing it rebuilds every buffer.
+    pub supersample: u32,
+    /// Fixed substep duration, seconds. Also structural: the whole
+    /// host-independence argument rests on it being constant, not on its value.
+    pub substep_seconds: f32,
     pub profile: TubeProfile,
     pub deposit: DepositParams,
     pub phosphor: PhosphorParams,
     pub readout: ReadoutParams,
+}
+
+impl Default for TubeParams {
+    fn default() -> Self {
+        Self {
+            supersample: crate::SUPERSAMPLE,
+            substep_seconds: crate::SUBSTEP_SECONDS as f32,
+            profile: TubeProfile::default(),
+            deposit: DepositParams::default(),
+            phosphor: PhosphorParams::default(),
+            readout: ReadoutParams::default(),
+        }
+    }
+}
+
+impl TubeParams {
+    /// Whether two sets differ in a way that needs the buffers rebuilding
+    /// rather than merely re-uploading a uniform.
+    pub fn needs_rebuild(&self, other: &Self) -> bool {
+        self.supersample != other.supersample || self.profile != other.profile
+    }
 }
 
 /// Every WGSL source the field needs.
@@ -41,6 +69,7 @@ pub struct Field {
     phosphor: Phosphor,
     readout: Readout,
     clock: SubstepClock,
+    params: TubeParams,
     /// Wall clock across the last advance. Deposition and the phosphor submit
     /// per substep, so they are measured together rather than per pass.
     last_advance_micros: f32,
@@ -59,6 +88,7 @@ impl Field {
         let deposit = Deposit::new(
             device,
             display_height,
+            params.supersample,
             params.profile,
             params.deposit,
             DepositShaders {
@@ -81,7 +111,7 @@ impl Field {
             queue,
             deposit.width(),
             deposit.height(),
-            crate::SUPERSAMPLE,
+            params.supersample,
             params.readout,
             &phosphor,
             ReadoutShaders {
@@ -96,7 +126,8 @@ impl Field {
             deposit,
             phosphor,
             readout,
-            clock: SubstepClock::new(epoch),
+            clock: SubstepClock::with_dt(epoch, f64::from(params.substep_seconds)),
+            params,
             last_advance_micros: 0.0,
             last_substeps: 0,
         }
@@ -121,6 +152,19 @@ impl Field {
 
     pub fn output_view(&self) -> &wgpu::TextureView {
         self.readout.output_view()
+    }
+
+    pub fn params(&self) -> TubeParams {
+        self.params
+    }
+
+    /// Apply parameters that only feed uniforms. Structural changes — see
+    /// [`TubeParams::needs_rebuild`] — need the field rebuilding instead.
+    pub fn set_params(&mut self, params: TubeParams) {
+        self.params = params;
+        self.deposit.set_params(params.deposit);
+        self.phosphor.set_params(params.phosphor);
+        self.readout.set_params(params.readout);
     }
 
     pub fn readout(&self) -> &Readout {

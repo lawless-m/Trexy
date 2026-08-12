@@ -107,6 +107,7 @@ pub fn debug(out: &Path, options: DebugOptions) -> Result<(), String> {
     let mut deposit = Deposit::new(
         &device,
         DISPLAY_HEIGHT,
+        tube_renderer::SUPERSAMPLE,
         TubeProfile::default(),
         DepositParams::default(),
         DepositShaders {

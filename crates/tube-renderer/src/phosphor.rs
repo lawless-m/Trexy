@@ -28,7 +28,8 @@ pub enum Component {
 /// zinc-sulfide blend whose components decay at different rates — which is the
 /// physical basis for there being two buffers at all. The τ values are
 /// order-of-magnitude placeholders to be tuned against reference footage.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct PhosphorParams {
     /// E_sat — knee of the hot-spot rolloff.
     pub e_sat: f32,
@@ -300,6 +301,12 @@ impl Phosphor {
 
     pub fn params(&self) -> PhosphorParams {
         self.params
+    }
+
+    /// Decay constants and the saturation knee feed a uniform written every
+    /// substep, so they change live.
+    pub fn set_params(&mut self, params: PhosphorParams) {
+        self.params = params;
     }
 
     /// The live buffer for a component — what the readout pass samples.

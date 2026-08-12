@@ -22,11 +22,13 @@ tube-shell — vector tube renderer
     tube-shell --headless --trace FILE --out PNG [options]
     tube-shell --headless-debug --out FILE [options]
     tube-shell --write-smoke-trace FILE     write a small .btr0 for smoke tests
+    tube-shell --write-profiles DIR         write the shipped tube profiles
 
   --headless options
     --sim-seconds S  how much of the trace to replay (default: all of it)
     --frame-hz N     simulated host cadence (default: 60)
     --view NAME      beauty | fast | slow | deposit | energy | samples
+    --params FILE    a tube profile as TOML (default: built-in Vectrex)
 
   --headless-debug options
     --debug-splat    select the forbidden point-splat path (reference only)
@@ -47,6 +49,10 @@ fn main() -> ExitCode {
         Some("--write-smoke-trace") => match args.get(1) {
             Some(path) => write_smoke_trace(Path::new(path)),
             None => Err(format!("--write-smoke-trace needs a path\n\n{USAGE}")),
+        },
+        Some("--write-profiles") => match args.get(1) {
+            Some(path) => write_profiles(Path::new(path)),
+            None => Err(format!("--write-profiles needs a directory\n\n{USAGE}")),
         },
         Some("--help" | "-h") => {
             print!("{USAGE}");
@@ -80,12 +86,22 @@ fn write_smoke_trace(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn write_profiles(dir: &Path) -> Result<(), String> {
+    for profile in [tube_renderer::vectrex_default(), tube_renderer::neutral()] {
+        let path = dir.join(format!("{}.toml", profile.name));
+        profile.save(&path)?;
+        println!("wrote {}", path.display());
+    }
+    Ok(())
+}
+
 fn parse_render(rest: &[String]) -> Result<RenderOptions, String> {
     let mut trace = None;
     let mut out = None;
     let mut sim_seconds = None;
     let mut frame_hz = DEFAULT_FRAME_HZ;
     let mut view = View::default();
+    let mut params = tube_renderer::TubeParams::default();
     let mut args = rest.iter();
 
     while let Some(arg) = args.next() {
@@ -95,6 +111,9 @@ fn parse_render(rest: &[String]) -> Result<RenderOptions, String> {
             "--out" => out = Some(PathBuf::from(value()?)),
             "--sim-seconds" => sim_seconds = Some(parse_number(arg, value()?)?),
             "--frame-hz" => frame_hz = parse_number(arg, value()?)?,
+            "--params" => {
+                params = tube_renderer::Profile::load(value()?)?.params;
+            }
             "--view" => {
                 let name = value()?;
                 view = View::from_name(name).ok_or_else(|| {
@@ -112,6 +131,7 @@ fn parse_render(rest: &[String]) -> Result<RenderOptions, String> {
         sim_seconds,
         frame_hz,
         view,
+        params,
     })
 }
 

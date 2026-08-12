@@ -10,3 +10,5 @@ repository.workspace = true
 beam-trace.workspace = true
 wgpu.workspace = true
 bytemuck.workspace = true
+serde.workspace = true
+toml.workspace = true
