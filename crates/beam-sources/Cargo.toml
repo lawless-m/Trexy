@@ -1,0 +1,10 @@
+[package]
+name = "beam-sources"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+beam-trace.workspace = true

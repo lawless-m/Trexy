@@ -1,0 +1,35 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/lawless-m/Trexy"
+
+[workspace.dependencies]
+# Workspace members (ARCHITECTURE.md §7)
+beam-trace = { path = "crates/beam-trace" }
+tube-renderer = { path = "crates/tube-renderer" }
+beam-sources = { path = "crates/beam-sources" }
+beam-rasteriser = { path = "crates/beam-rasteriser" }
+
+# Graphics. Native Linux only, Vulkan primary, WGSL against the WebGPU feature
+# set. No WebGL2 path anywhere (ARCHITECTURE.md §7), hence egui-wgpu's default
+# features — which pull wgpu/webgl and wgpu/metal — are off; wgpu's own default
+# features below supply the native backends.
+wgpu = "30.0"
+winit = "0.30"
+egui = "0.36"
+egui-wgpu = { version = "0.36", default-features = false, features = [
+    "winit",
+    "x11",
+    "wayland",
+] }
+egui-winit = "0.36"
+
+bytemuck = { version = "1.25", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+toml = "1.1"
