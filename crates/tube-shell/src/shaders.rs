@@ -32,7 +32,8 @@ pub fn validate_wgsl(source: &str) -> Result<(), String> {
 #[derive(Debug, Default)]
 pub struct ShaderLibrary {
     good: BTreeMap<String, String>,
-    error: Option<String>,
+    /// Per file, so a file that validates cannot mask a sibling that did not.
+    errors: BTreeMap<String, String>,
     generation: u64,
 }
 
@@ -52,12 +53,12 @@ impl ShaderLibrary {
                     self.good.insert(name.to_owned(), source.to_owned());
                     self.generation += 1;
                 }
-                self.error = None;
+                self.errors.remove(name);
                 Ok(())
             }
             Err(text) => {
                 let message = format!("{name}: {text}");
-                self.error = Some(message.clone());
+                self.errors.insert(name.to_owned(), message.clone());
                 Err(message)
             }
         }
@@ -70,7 +71,8 @@ impl ShaderLibrary {
         let entries = match std::fs::read_dir(dir) {
             Ok(entries) => entries,
             Err(e) => {
-                self.error = Some(format!("{}: {e}", dir.display()));
+                self.errors
+                    .insert(dir.display().to_string(), format!("{}: {e}", dir.display()));
                 return self.generation;
             }
         };
@@ -89,7 +91,9 @@ impl ShaderLibrary {
                 Ok(source) => {
                     let _ = self.offer(&name, &source);
                 }
-                Err(e) => self.error = Some(format!("{name}: {e}")),
+                Err(e) => {
+                    self.errors.insert(name.clone(), format!("{name}: {e}"));
+                }
             }
         }
         self.generation
@@ -100,9 +104,13 @@ impl ShaderLibrary {
         self.good.get(name).map(String::as_str)
     }
 
-    /// Error text from the most recent failed reload, for the panel.
-    pub fn error(&self) -> Option<&str> {
-        self.error.as_deref()
+    /// Every outstanding error, for the panel. `None` when the whole directory
+    /// is good.
+    pub fn error(&self) -> Option<String> {
+        if self.errors.is_empty() {
+            return None;
+        }
+        Some(self.errors.values().cloned().collect::<Vec<_>>().join("\n"))
     }
 
     /// Bumped whenever an installed source changes.

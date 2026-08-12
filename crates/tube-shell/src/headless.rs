@@ -198,6 +198,7 @@ fn simulate_decay(
     };
     let mut field = Field::new(
         device,
+        queue,
         DISPLAY_HEIGHT,
         TubeParams::default(),
         FieldShaders {
@@ -205,9 +206,12 @@ fn simulate_decay(
             splat: source("deposit_splat.wgsl")?,
             resolve: source("deposit_resolve.wgsl")?,
             phosphor: source("phosphor.wgsl")?,
+            deposit_total: source("deposit_total.wgsl")?,
             readout: source("readout.wgsl")?,
             blur: source("blur.wgsl")?,
             tonemap: source("tonemap.wgsl")?,
+            view: source("view.wgsl")?,
+            sample_points: source("sample_points.wgsl")?,
         },
         0.0,
     );

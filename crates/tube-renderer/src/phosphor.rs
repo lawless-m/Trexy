@@ -10,11 +10,15 @@ use crate::readback::read_texture;
 
 const WORKGROUP: u32 = 8;
 
-/// Which retained buffer to look at.
+/// Which buffer to look at.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Component {
     Fast,
     Slow,
+    /// Every substep's deposition summed with no saturation and no decay.
+    /// Not retained state and not part of the model — it exists only for the
+    /// decay-frozen debug view (RENDERER.md §5).
+    DepositTotal,
 }
 
 /// Phosphor parameters. All fitted class (RENDERER.md §4).
@@ -68,13 +72,18 @@ pub struct Phosphor {
 
     fast: [wgpu::Texture; 2],
     slow: [wgpu::Texture; 2],
+    /// Debug instrumentation; see [`Component::DepositTotal`].
+    deposit_total: [wgpu::Texture; 2],
     /// Which half of the ping-pong currently holds the live state.
     current: usize,
 
     params_buffer: wgpu::Buffer,
+    resolution_buffer: wgpu::Buffer,
     pipeline: wgpu::ComputePipeline,
     /// One per ping-pong direction.
     bind_groups: [wgpu::BindGroup; 2],
+    total_pipeline: wgpu::ComputePipeline,
+    total_bind_groups: [wgpu::BindGroup; 2],
 }
 
 impl Phosphor {
@@ -85,6 +94,7 @@ impl Phosphor {
         params: PhosphorParams,
         deposit_view: &wgpu::TextureView,
         source: &str,
+        total_source: &str,
     ) -> Self {
         // Both buffers are ping-ponged; see the note in phosphor.wgsl for why
         // in-place update is not available in core WebGPU. `phosphor_slow`
@@ -106,6 +116,15 @@ impl Phosphor {
                 height,
                 wgpu::TextureFormat::Rgba32Float,
                 &format!("phosphor_slow[{i}]"),
+            )
+        });
+        let deposit_total = std::array::from_fn(|i| {
+            make_texture(
+                device,
+                width,
+                height,
+                wgpu::TextureFormat::Rgba16Float,
+                &format!("deposit_total[{i}]"),
             )
         });
 
@@ -191,16 +210,91 @@ impl Phosphor {
             cache: None,
         });
 
+        // Deposit-only accumulation for the debug view. A separate pipeline so
+        // the production accumulation above is exactly what RENDERER.md §3.1
+        // specifies, with no debug outputs threaded through it.
+        let resolution_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("deposit_total resolution"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let total_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("deposit_total"),
+            entries: &[
+                loaded_texture(0),
+                loaded_texture(1),
+                storage_texture(2, wgpu::TextureFormat::Rgba16Float),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let total_bind_groups = std::array::from_fn(|i| {
+            let (from, to) = (i, 1 - i);
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("deposit_total"),
+                layout: &total_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(deposit_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&view(&deposit_total[from])),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&view(&deposit_total[to])),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: resolution_buffer.as_entire_binding(),
+                    },
+                ],
+            })
+        });
+        let total_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("deposit_total"),
+            source: wgpu::ShaderSource::Wgsl(total_source.into()),
+        });
+        let total_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("deposit_total"),
+                bind_group_layouts: &[Some(&total_layout)],
+                immediate_size: 0,
+            });
+        let total_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("deposit_total"),
+            layout: Some(&total_pipeline_layout),
+            module: &total_module,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
         Self {
             width,
             height,
             params,
             fast,
             slow,
+            deposit_total,
             current: 0,
             params_buffer,
+            resolution_buffer,
             pipeline,
             bind_groups,
+            total_pipeline,
+            total_bind_groups,
         }
     }
 
@@ -223,6 +317,7 @@ impl Phosphor {
         match component {
             Component::Fast => &self.fast[phase],
             Component::Slow => &self.slow[phase],
+            Component::DepositTotal => &self.deposit_total[phase],
         }
     }
 
@@ -237,6 +332,11 @@ impl Phosphor {
         deposit_gain: f32,
     ) {
         self.write_params(queue, substep_seconds, deposit_gain);
+        queue.write_buffer(
+            &self.resolution_buffer,
+            0,
+            bytemuck::bytes_of(&[self.width, self.height, 0, 0]),
+        );
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("phosphor substep"),
@@ -253,6 +353,16 @@ impl Phosphor {
                 self.height.div_ceil(WORKGROUP),
                 1,
             );
+
+            // Debug instrumentation, stepped in lockstep so the two share a
+            // ping-pong phase.
+            pass.set_pipeline(&self.total_pipeline);
+            pass.set_bind_group(0, &self.total_bind_groups[self.current], &[]);
+            pass.dispatch_workgroups(
+                self.width.div_ceil(WORKGROUP),
+                self.height.div_ceil(WORKGROUP),
+                1,
+            );
         }
         queue.submit([encoder.finish()]);
         self.current = 1 - self.current;
@@ -263,7 +373,12 @@ impl Phosphor {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("phosphor clear"),
         });
-        for texture in self.fast.iter().chain(self.slow.iter()) {
+        for texture in self
+            .fast
+            .iter()
+            .chain(self.slow.iter())
+            .chain(self.deposit_total.iter())
+        {
             encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("phosphor clear"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {

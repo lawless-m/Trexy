@@ -11,6 +11,7 @@ use std::process::ExitCode;
 
 use headless::DebugOptions;
 use render::{DEFAULT_FRAME_HZ, RenderOptions};
+use tube_renderer::View;
 
 const USAGE: &str = "\
 tube-shell — vector tube renderer
@@ -24,6 +25,7 @@ tube-shell — vector tube renderer
   --headless options
     --sim-seconds S  how much of the trace to replay (default: all of it)
     --frame-hz N     simulated host cadence (default: 60)
+    --view NAME      beauty | fast | slow | deposit | energy | samples
 
   --headless-debug options
     --debug-splat    select the forbidden point-splat path (reference only)
@@ -82,6 +84,7 @@ fn parse_render(rest: &[String]) -> Result<RenderOptions, String> {
     let mut out = None;
     let mut sim_seconds = None;
     let mut frame_hz = DEFAULT_FRAME_HZ;
+    let mut view = View::default();
     let mut args = rest.iter();
 
     while let Some(arg) = args.next() {
@@ -91,6 +94,13 @@ fn parse_render(rest: &[String]) -> Result<RenderOptions, String> {
             "--out" => out = Some(PathBuf::from(value()?)),
             "--sim-seconds" => sim_seconds = Some(parse_number(arg, value()?)?),
             "--frame-hz" => frame_hz = parse_number(arg, value()?)?,
+            "--view" => {
+                let name = value()?;
+                view = View::from_name(name).ok_or_else(|| {
+                    let names: Vec<&str> = View::ALL.iter().map(|v| v.name()).collect();
+                    format!("unknown view {name}; try one of {}", names.join(", "))
+                })?;
+            }
             other => return Err(format!("unknown argument {other}\n\n{USAGE}")),
         }
     }
@@ -100,6 +110,7 @@ fn parse_render(rest: &[String]) -> Result<RenderOptions, String> {
         out: out.ok_or_else(|| format!("--headless needs --out PNG\n\n{USAGE}"))?,
         sim_seconds,
         frame_hz,
+        view,
     })
 }
 

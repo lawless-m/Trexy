@@ -12,8 +12,11 @@
 
 use bytemuck::{Pod, Zeroable};
 
+use beam_trace::Sample;
+
 use crate::phosphor::{Component, Phosphor};
 use crate::readback::read_texture;
+use crate::timing::{PassTimer, READOUT_PASSES, Timings};
 
 /// The wide halo is blurred at this fraction of the deposit resolution. A σ of
 /// 0.06 face units is affordable only because most of the work happens small.
@@ -74,6 +77,68 @@ pub struct ReadoutShaders<'a> {
     pub readout: &'a str,
     pub blur: &'a str,
     pub tonemap: &'a str,
+    pub view: &'a str,
+    pub sample_points: &'a str,
+}
+
+/// What to put on screen — RENDERER.md §5. First-class, not afterthoughts:
+/// the development loop is trace replay plus shader hot-reload plus these.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum View {
+    /// The full chain, tonemapped.
+    #[default]
+    Beauty,
+    /// Raw `phosphor_fast`, exposure-scaled.
+    PhosphorFast,
+    /// Raw `phosphor_slow`, exposure-scaled.
+    PhosphorSlow,
+    /// Every substep's deposition summed, with decay frozen.
+    DepositOnly,
+    /// Total excitation on a log false-colour ramp.
+    FalseColour,
+    /// The beauty render with a dot at each trace sample.
+    SamplePoints,
+}
+
+impl View {
+    pub const ALL: [View; 6] = [
+        View::Beauty,
+        View::PhosphorFast,
+        View::PhosphorSlow,
+        View::DepositOnly,
+        View::FalseColour,
+        View::SamplePoints,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            View::Beauty => "beauty",
+            View::PhosphorFast => "fast",
+            View::PhosphorSlow => "slow",
+            View::DepositOnly => "deposit",
+            View::FalseColour => "energy",
+            View::SamplePoints => "samples",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|v| v.name() == name)
+    }
+
+    /// The mode number view.wgsl switches on. Beauty and SamplePoints do not
+    /// use that shader at all.
+    fn mode(self) -> u32 {
+        match self {
+            View::PhosphorFast => 0,
+            View::PhosphorSlow => 1,
+            View::DepositOnly => 2,
+            _ => 3,
+        }
+    }
+
+    fn uses_view_shader(self) -> bool {
+        !matches!(self, View::Beauty | View::SamplePoints)
+    }
 }
 
 #[repr(C)]
@@ -87,6 +152,26 @@ struct GpuChroma {
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct GpuBlur {
     step: [f32; 2],
+    _pad: [f32; 2],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct GpuView {
+    mode: u32,
+    exposure: f32,
+    decades: f32,
+    _pad: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct GpuOverlay {
+    radius: [f32; 2],
+    aspect: f32,
+    pincushion: f32,
+    rotation: f32,
+    overscan: f32,
     _pad: [f32; 2],
 }
 
@@ -134,11 +219,26 @@ pub struct Readout {
     blurs: [BlurPass; 4],
     tonemap_pipeline: wgpu::RenderPipeline,
     tonemap_bind_group: wgpu::BindGroup,
+
+    view_pipeline: wgpu::RenderPipeline,
+    view_bind_groups: [wgpu::BindGroup; 2],
+    view_buffer: wgpu::Buffer,
+
+    overlay_pipeline: wgpu::RenderPipeline,
+    overlay_layout: wgpu::BindGroupLayout,
+    overlay_bind_group: wgpu::BindGroup,
+    overlay_buffer: wgpu::Buffer,
+    points_buffer: wgpu::Buffer,
+    points_capacity: u64,
+
+    timer: Option<PassTimer>,
 }
 
 impl Readout {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         width: u32,
         height: u32,
         supersample: u32,
@@ -338,6 +438,91 @@ impl Readout {
         let tonemap_pipeline =
             fullscreen_pipeline(device, "tonemap", shaders.tonemap, &tonemap_layout);
 
+        // --- debug views ----------------------------------------------------
+        let view_buffer = uniform_buffer::<GpuView>(device, "view");
+        let view_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("view"),
+            entries: &[
+                loaded_texture(0),
+                loaded_texture(1),
+                loaded_texture(2),
+                uniform_entry(3),
+            ],
+        });
+        let view_bind_groups = std::array::from_fn(|phase| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("view"),
+                layout: &view_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&view(
+                            phosphor.phase_texture(Component::Fast, phase),
+                        )),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&view(
+                            phosphor.phase_texture(Component::Slow, phase),
+                        )),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&view(
+                            phosphor.phase_texture(Component::DepositTotal, phase),
+                        )),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: view_buffer.as_entire_binding(),
+                    },
+                ],
+            })
+        });
+        let view_pipeline = fullscreen_pipeline(device, "view", shaders.view, &view_layout);
+
+        let overlay_buffer = uniform_buffer::<GpuOverlay>(device, "sample points");
+        let points_capacity = (size_of::<Sample>() * 64) as u64;
+        let points_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("sample points"),
+            size: points_capacity,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let overlay_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("sample points"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let overlay_bind_group =
+            overlay_bind(device, &overlay_layout, &points_buffer, &overlay_buffer);
+        let overlay_pipeline = fullscreen_pipeline(
+            device,
+            "sample points",
+            shaders.sample_points,
+            &overlay_layout,
+        );
+
         Self {
             width,
             height,
@@ -355,6 +540,16 @@ impl Readout {
             blurs,
             tonemap_pipeline,
             tonemap_bind_group,
+            view_pipeline,
+            view_bind_groups,
+            view_buffer,
+            overlay_pipeline,
+            overlay_layout,
+            overlay_bind_group,
+            overlay_buffer,
+            points_buffer,
+            points_capacity,
+            timer: PassTimer::new(device, queue, READOUT_PASSES.len() as u32),
         }
     }
 
@@ -374,9 +569,26 @@ impl Readout {
         self.params
     }
 
-    /// Run the whole chain: combine, scatter, halo, geometry, glass, tonemap.
-    pub fn render(&self, device: &wgpu::Device, queue: &wgpu::Queue, phosphor: &Phosphor) {
-        self.write_uniforms(queue);
+    /// Run the whole chain: combine, scatter, halo, then either the tonemap or
+    /// a debug view, and optionally the sample-point overlay on top.
+    ///
+    /// Returns per-pass GPU timings when the adapter supports them.
+    pub fn render(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        phosphor: &Phosphor,
+        view: View,
+        points: &[Sample],
+    ) -> Timings {
+        self.write_uniforms(queue, view);
+        if view == View::SamplePoints {
+            self.upload_points(device, queue, points);
+        }
+
+        let phase = phosphor.phase();
+        let timer = self.timer.as_ref();
+        let at = |index: u32| timer.map(|t| (t, index));
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("readout"),
@@ -387,26 +599,101 @@ impl Readout {
             "combine",
             &self.readout_view,
             &self.readout_pipeline,
-            &self.readout_bind_groups[phosphor.phase()],
+            &self.readout_bind_groups[phase],
+            at(0),
         );
         for (index, blur) in self.blurs.iter().enumerate() {
             pass(
                 &mut encoder,
-                &format!("blur[{index}]"),
+                READOUT_PASSES[1 + index],
                 &blur.view,
                 &self.blur_pipeline,
                 &blur.bind_group,
+                at(1 + index as u32),
             );
         }
-        pass(
-            &mut encoder,
-            "tonemap",
-            &self.output_view,
-            &self.tonemap_pipeline,
-            &self.tonemap_bind_group,
-        );
+        if view.uses_view_shader() {
+            pass(
+                &mut encoder,
+                "view",
+                &self.output_view,
+                &self.view_pipeline,
+                &self.view_bind_groups[phase],
+                at(5),
+            );
+        } else {
+            pass(
+                &mut encoder,
+                "tonemap",
+                &self.output_view,
+                &self.tonemap_pipeline,
+                &self.tonemap_bind_group,
+                at(5),
+            );
+        }
 
+        if view == View::SamplePoints && !points.is_empty() {
+            // Drawn over the finished image, so the load op keeps it.
+            let mut overlay = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("sample points"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.output_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            overlay.set_pipeline(&self.overlay_pipeline);
+            overlay.set_bind_group(0, &self.overlay_bind_group, &[]);
+            overlay.draw(0..6, 0..points.len() as u32);
+        }
+
+        if let Some(timer) = timer {
+            timer.resolve(&mut encoder);
+        }
         queue.submit([encoder.finish()]);
+
+        Timings {
+            readout: self
+                .timer
+                .as_ref()
+                .map(|t| t.read(device))
+                .unwrap_or_default(),
+            gpu_supported: self.timer.is_some(),
+            ..Timings::default()
+        }
+    }
+
+    /// Grow the overlay's storage buffer to fit and upload the samples. The
+    /// bind group is rebuilt only when the buffer is replaced.
+    fn upload_points(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, points: &[Sample]) {
+        let bytes: &[u8] = bytemuck::cast_slice(points);
+        let needed = (bytes.len() as u64).max(size_of::<Sample>() as u64);
+        if needed > self.points_capacity {
+            self.points_capacity = needed.next_power_of_two();
+            self.points_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("sample points"),
+                size: self.points_capacity,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.overlay_bind_group = overlay_bind(
+                device,
+                &self.overlay_layout,
+                &self.points_buffer,
+                &self.overlay_buffer,
+            );
+        }
+        if !bytes.is_empty() {
+            queue.write_buffer(&self.points_buffer, 0, bytes);
+        }
     }
 
     /// The final image, as display values in 0..1.
@@ -420,7 +707,7 @@ impl Readout {
         )
     }
 
-    fn write_uniforms(&self, queue: &wgpu::Queue) {
+    fn write_uniforms(&self, queue: &wgpu::Queue, view: View) {
         let rgb = |c: [f32; 3]| [c[0], c[1], c[2], 0.0];
         queue.write_buffer(
             &self.chroma_buffer,
@@ -454,7 +741,58 @@ impl Readout {
                 exposure: self.params.exposure,
             }),
         );
+        queue.write_buffer(
+            &self.view_buffer,
+            0,
+            bytemuck::bytes_of(&GpuView {
+                mode: view.mode(),
+                exposure: self.params.exposure,
+                // Enough range to see a fresh stroke and the tail of an old one
+                // in the same picture.
+                decades: 6.0,
+                _pad: 0.0,
+            }),
+        );
+        // Three output pixels across, in normalised device coordinates.
+        let radius = [
+            6.0 / self.output_width as f32,
+            6.0 / self.output_height as f32,
+        ];
+        queue.write_buffer(
+            &self.overlay_buffer,
+            0,
+            bytemuck::bytes_of(&GpuOverlay {
+                radius,
+                aspect: self.width as f32 / self.height as f32,
+                pincushion: self.params.pincushion,
+                rotation: self.params.rotation,
+                overscan: self.params.overscan,
+                _pad: [0.0, 0.0],
+            }),
+        );
     }
+}
+
+fn overlay_bind(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    points: &wgpu::Buffer,
+    uniform: &wgpu::Buffer,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("sample points"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: points.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: uniform.as_entire_binding(),
+            },
+        ],
+    })
 }
 
 fn pass(
@@ -463,6 +801,7 @@ fn pass(
     target: &wgpu::TextureView,
     pipeline: &wgpu::RenderPipeline,
     bind_group: &wgpu::BindGroup,
+    timer: Option<(&PassTimer, u32)>,
 ) {
     let mut render = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
         label: Some(label),
@@ -476,7 +815,7 @@ fn pass(
             },
         })],
         depth_stencil_attachment: None,
-        timestamp_writes: None,
+        timestamp_writes: timer.map(|(t, index)| t.render_writes(index)),
         occlusion_query_set: None,
         multiview_mask: None,
     });

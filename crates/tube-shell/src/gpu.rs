@@ -8,6 +8,12 @@ pub fn instance() -> wgpu::Instance {
     wgpu::Instance::new(descriptor)
 }
 
+/// Per-pass GPU timings need this; it is optional, so ask only for what the
+/// adapter actually has (RENDERER.md §5).
+pub fn timing_features(adapter: &wgpu::Adapter) -> wgpu::Features {
+    adapter.features() & wgpu::Features::TIMESTAMP_QUERY
+}
+
 /// A device with no window and no surface, for headless rendering.
 pub fn headless_device() -> Result<(wgpu::Device, wgpu::Queue), String> {
     let instance = instance();
@@ -21,6 +27,7 @@ pub fn headless_device() -> Result<(wgpu::Device, wgpu::Queue), String> {
 
     pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("headless"),
+        required_features: timing_features(&adapter),
         ..Default::default()
     }))
     .map_err(|e| format!("no device: {e}"))

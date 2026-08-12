@@ -4,8 +4,9 @@ use beam_trace::Sample;
 
 use crate::deposit::{Deposit, DepositMode, DepositParams, DepositShaders, TubeProfile};
 use crate::phosphor::{Component, Phosphor, PhosphorParams};
-use crate::readout::{Readout, ReadoutParams, ReadoutShaders};
+use crate::readout::{Readout, ReadoutParams, ReadoutShaders, View};
 use crate::substep::{SubstepClock, clip_spans};
+use crate::timing::Timings;
 
 /// Every parameter the tube model takes, grouped by the pass that owns it.
 /// The provenance classes live on the individual structs (ARCHITECTURE.md §4).
@@ -23,9 +24,12 @@ pub struct FieldShaders<'a> {
     pub splat: &'a str,
     pub resolve: &'a str,
     pub phosphor: &'a str,
+    pub deposit_total: &'a str,
     pub readout: &'a str,
     pub blur: &'a str,
     pub tonemap: &'a str,
+    pub view: &'a str,
+    pub sample_points: &'a str,
 }
 
 /// Deposition plus the phosphor field it feeds, driven on the fixed substep
@@ -37,11 +41,16 @@ pub struct Field {
     phosphor: Phosphor,
     readout: Readout,
     clock: SubstepClock,
+    /// Wall clock across the last advance. Deposition and the phosphor submit
+    /// per substep, so they are measured together rather than per pass.
+    last_advance_micros: f32,
+    last_substeps: usize,
 }
 
 impl Field {
     pub fn new(
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         display_height: u32,
         params: TubeParams,
         shaders: FieldShaders<'_>,
@@ -65,9 +74,11 @@ impl Field {
             params.phosphor,
             deposit.scratch_view(),
             shaders.phosphor,
+            shaders.deposit_total,
         );
         let readout = Readout::new(
             device,
+            queue,
             deposit.width(),
             deposit.height(),
             crate::SUPERSAMPLE,
@@ -77,6 +88,8 @@ impl Field {
                 readout: shaders.readout,
                 blur: shaders.blur,
                 tonemap: shaders.tonemap,
+                view: shaders.view,
+                sample_points: shaders.sample_points,
             },
         );
         Self {
@@ -84,12 +97,29 @@ impl Field {
             phosphor,
             readout,
             clock: SubstepClock::new(epoch),
+            last_advance_micros: 0.0,
+            last_substeps: 0,
         }
     }
 
-    /// Run the readout chain and return the final tonemapped image's view.
-    pub fn render(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> &wgpu::TextureView {
-        self.readout.render(device, queue, &self.phosphor);
+    /// Run the readout chain for `view` and return its timings. `points` is
+    /// only read by the sample-point overlay.
+    pub fn render(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        view: View,
+        points: &[Sample],
+    ) -> Timings {
+        let mut timings = self
+            .readout
+            .render(device, queue, &self.phosphor, view, points);
+        timings.field_advance_micros = self.last_advance_micros;
+        timings.substeps = self.last_substeps;
+        timings
+    }
+
+    pub fn output_view(&self) -> &wgpu::TextureView {
         self.readout.output_view()
     }
 
@@ -138,6 +168,7 @@ impl Field {
         now: f64,
         mode: DepositMode,
     ) -> usize {
+        let started = std::time::Instant::now();
         let substeps = self.clock.advance(now);
         let dt = self.clock.dt();
 
@@ -152,6 +183,8 @@ impl Field {
             };
             self.phosphor.step(device, queue, dt, gain);
         }
+        self.last_advance_micros = started.elapsed().as_secs_f32() * 1e6;
+        self.last_substeps = substeps.len();
         substeps.len()
     }
 

@@ -1,6 +1,5 @@
-//! The winit application: window, wgpu surface, egui side panel, the
-//! file-watcher half of WGSL hot-reload, and the debug view of the deposit
-//! buffer.
+//! The winit application: window, wgpu surface, egui side panel, WGSL
+//! hot-reload, and the debug view selector.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -8,20 +7,22 @@ use std::sync::mpsc::{Receiver, channel};
 
 use bytemuck::{Pod, Zeroable};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
-use tube_renderer::{Deposit, DepositMode, DepositParams, DepositShaders, TubeProfile};
+use tube_renderer::{DepositMode, Field, FieldShaders, READOUT_PASSES, Timings, TubeParams, View};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId};
 
 use crate::gpu;
-use crate::headless::{DISPLAY_HEIGHT, hardcoded_spans};
+use crate::headless::hardcoded_spans;
+use crate::render::DISPLAY_HEIGHT;
 use crate::shaders::{ShaderLibrary, shader_dir};
 
-const DEPOSIT_SHADER: &str = "deposit.wgsl";
-const SPLAT_SHADER: &str = "deposit_splat.wgsl";
-const RESOLVE_SHADER: &str = "deposit_resolve.wgsl";
 const PRESENT_SHADER: &str = "present.wgsl";
+
+/// The debug spans run to here; the shell replays them once per rebuild until
+/// live sources arrive.
+const TRACE_END: f64 = 0.007;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -34,10 +35,9 @@ struct PresentUniform {
 /// Everything rebuilt when a shader changes. Held as a unit so a failed
 /// rebuild leaves the previous one running untouched.
 struct Rendered {
-    deposit: Deposit,
+    field: Field,
     pipeline: wgpu::RenderPipeline,
     bind_group: wgpu::BindGroup,
-    exposure: f32,
 }
 
 struct Gpu {
@@ -56,6 +56,8 @@ struct Gpu {
     rendered_generation: Option<u64>,
     /// Debug toggle for the forbidden point-splat path (FIRST-SLICE.md §4).
     splat: bool,
+    view: View,
+    timings: Timings,
 
     egui_ctx: egui::Context,
     egui_state: egui_winit::State,
@@ -197,13 +199,14 @@ impl Gpu {
         let (device, queue) =
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                 label: Some("tube-shell"),
+                required_features: gpu::timing_features(&adapter),
                 ..Default::default()
             }))?;
 
         let size = window.inner_size();
         let caps = surface.get_capabilities(&adapter);
-        // All maths is in linear light and tonemapped once at the end
-        // (CONTENTS.md), so the surface does the linear→sRGB encode.
+        // The tonemap emits linear display values; the sRGB surface encodes
+        // them. That is the one and only place the boundary is crossed.
         let format = caps
             .formats
             .iter()
@@ -289,6 +292,8 @@ impl Gpu {
             rendered: None,
             rendered_generation: None,
             splat: false,
+            view: View::default(),
+            timings: Timings::default(),
             egui_ctx,
             egui_state,
             egui_renderer,
@@ -304,39 +309,72 @@ impl Gpu {
         self.surface.configure(&self.device, &self.config);
     }
 
-    /// Rebuild the deposition pass and the present pipeline from the library's
-    /// installed sources, then deposit the debug spans once. If the library has
-    /// nothing valid, whatever is already running is left alone — that is what
-    /// "keep the last good pipeline" means in practice.
+    fn mode(&self) -> DepositMode {
+        if self.splat {
+            DepositMode::Splat
+        } else {
+            DepositMode::Analytic
+        }
+    }
+
+    /// Rebuild the whole chain from the library's installed sources and replay
+    /// the debug spans once. If the library has nothing valid, whatever is
+    /// already running is left alone — that is "keep the last good pipeline".
     fn rebuild(&mut self, shaders: &ShaderLibrary) {
         if self.rendered_generation == Some(shaders.generation()) {
             return;
         }
-        let (Some(deposit_source), Some(splat_source), Some(resolve_source), Some(present_source)) = (
-            shaders.get(DEPOSIT_SHADER),
-            shaders.get(SPLAT_SHADER),
-            shaders.get(RESOLVE_SHADER),
-            shaders.get(PRESENT_SHADER),
-        ) else {
+        let source = |name: &str| shaders.get(name);
+        let Some(present_source) = source(PRESENT_SHADER) else {
             return;
         };
+        let names = [
+            "deposit.wgsl",
+            "deposit_splat.wgsl",
+            "deposit_resolve.wgsl",
+            "phosphor.wgsl",
+            "deposit_total.wgsl",
+            "readout.wgsl",
+            "blur.wgsl",
+            "tonemap.wgsl",
+            "view.wgsl",
+            "sample_points.wgsl",
+        ];
+        if names.iter().any(|name| source(name).is_none()) {
+            return;
+        }
 
         // Already naga-validated on the CPU, so these compiles are not expected
         // to fail; if the backend disagrees, keep what is running.
         let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
 
-        let mut deposit = Deposit::new(
+        let mut field = Field::new(
             &self.device,
+            &self.queue,
             DISPLAY_HEIGHT,
-            TubeProfile::default(),
-            DepositParams::default(),
-            DepositShaders {
-                deposit: deposit_source,
-                splat: splat_source,
-                resolve: resolve_source,
+            TubeParams::default(),
+            FieldShaders {
+                deposit: source("deposit.wgsl").expect("checked"),
+                splat: source("deposit_splat.wgsl").expect("checked"),
+                resolve: source("deposit_resolve.wgsl").expect("checked"),
+                phosphor: source("phosphor.wgsl").expect("checked"),
+                deposit_total: source("deposit_total.wgsl").expect("checked"),
+                readout: source("readout.wgsl").expect("checked"),
+                blur: source("blur.wgsl").expect("checked"),
+                tonemap: source("tonemap.wgsl").expect("checked"),
+                view: source("view.wgsl").expect("checked"),
+                sample_points: source("sample_points.wgsl").expect("checked"),
             },
+            0.0,
         );
-        deposit.run(&self.device, &self.queue, &hardcoded_spans(), self.mode());
+        field.clear(&self.device, &self.queue);
+        field.advance(
+            &self.device,
+            &self.queue,
+            &hardcoded_spans(),
+            TRACE_END,
+            self.mode(),
+        );
 
         let module = self
             .device
@@ -380,7 +418,7 @@ impl Gpu {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(deposit.scratch_view()),
+                    resource: wgpu::BindingResource::TextureView(field.output_view()),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -398,53 +436,34 @@ impl Gpu {
             return;
         }
 
-        // One readback to set the debug exposure. Deposited energies are tiny
-        // in absolute terms; the real chain tonemaps instead (RENDERER.md §3.3).
-        let peak = deposit
-            .read_back(&self.device, &self.queue)
-            .iter()
-            .map(|texel| texel[0].max(texel[1]).max(texel[2]))
-            .fold(0.0f32, f32::max);
-
         self.rendered = Some(Rendered {
-            deposit,
+            field,
             pipeline,
             bind_group,
-            exposure: if peak > 0.0 { 1.0 / peak } else { 1.0 },
         });
         self.rendered_generation = Some(shaders.generation());
     }
 
-    fn mode(&self) -> DepositMode {
-        if self.splat {
-            DepositMode::Splat
-        } else {
-            DepositMode::Analytic
-        }
-    }
-
-    /// Re-run deposition after the debug path is toggled, and re-derive the
-    /// debug exposure from the new peak.
+    /// Redraw the field from scratch after a debug toggle changed what it
+    /// should contain.
     fn redeposit(&mut self) {
         let mode = self.mode();
         let Some(rendered) = &mut self.rendered else {
             return;
         };
-        rendered
-            .deposit
-            .run(&self.device, &self.queue, &hardcoded_spans(), mode);
-        let peak = rendered
-            .deposit
-            .read_back(&self.device, &self.queue)
-            .iter()
-            .map(|texel| texel[0].max(texel[1]).max(texel[2]))
-            .fold(0.0f32, f32::max);
-        rendered.exposure = if peak > 0.0 { 1.0 / peak } else { 1.0 };
+        rendered.field.clear(&self.device, &self.queue);
+        rendered.field.advance(
+            &self.device,
+            &self.queue,
+            &hardcoded_spans(),
+            TRACE_END,
+            mode,
+        );
     }
 
     /// Letterbox the tube face into the window without distorting it.
     fn present_uniform(&self, rendered: &Rendered) -> PresentUniform {
-        let tube = rendered.deposit.width() as f32 / rendered.deposit.height() as f32;
+        let tube = rendered.field.output_width() as f32 / rendered.field.output_height() as f32;
         let window = self.config.width as f32 / self.config.height as f32;
         let fit = if window > tube {
             [tube / window, 1.0]
@@ -453,7 +472,8 @@ impl Gpu {
         };
         PresentUniform {
             fit,
-            exposure: rendered.exposure,
+            // The chain has already tonemapped; this blit only places it.
+            exposure: 1.0,
             _pad: 0.0,
         }
     }
@@ -480,17 +500,30 @@ impl Gpu {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
-        if let Some(rendered) = &self.rendered {
-            let uniform = self.present_uniform(rendered);
+        // Run the readout chain for the selected view.
+        let selected = self.view;
+        let uniform = self
+            .rendered
+            .as_ref()
+            .map(|rendered| self.present_uniform(rendered));
+        if let Some(uniform) = uniform {
             self.queue
                 .write_buffer(&self.present_buffer, 0, bytemuck::bytes_of(&uniform));
+        }
+        if let Some(rendered) = &mut self.rendered {
+            self.timings =
+                rendered
+                    .field
+                    .render(&self.device, &self.queue, selected, &hardcoded_spans());
         }
 
         let raw_input = self.egui_state.take_egui_input(&self.window);
         let mut splat = self.splat;
+        let mut chosen = self.view;
         let output = self.egui_ctx.clone().run_ui(raw_input, |ui| {
-            self.panel(ui, shaders, &mut splat);
+            self.panel(ui, shaders, &mut splat, &mut chosen);
         });
+        self.view = chosen;
         if splat != self.splat {
             self.splat = splat;
             self.redeposit();
@@ -561,7 +594,7 @@ impl Gpu {
         }
     }
 
-    fn panel(&self, ui: &mut egui::Ui, shaders: &ShaderLibrary, splat: &mut bool) {
+    fn panel(&self, ui: &mut egui::Ui, shaders: &ShaderLibrary, splat: &mut bool, view: &mut View) {
         egui::Panel::left("shell").show(ui, |ui| {
             ui.heading("Trexy");
             ui.label(format!(
@@ -570,19 +603,22 @@ impl Gpu {
             ));
             ui.separator();
 
-            match &self.rendered {
-                Some(rendered) => {
-                    ui.label(format!(
-                        "deposit {}×{}",
-                        rendered.deposit.width(),
-                        rendered.deposit.height()
-                    ));
-                    ui.label(format!("debug exposure ×{:.0}", rendered.exposure));
-                }
-                None => {
-                    ui.label("no valid shader set");
-                }
+            ui.label("view");
+            for candidate in View::ALL {
+                ui.radio_value(view, candidate, candidate.name());
             }
+            ui.separator();
+
+            if let Some(rendered) = &self.rendered {
+                ui.label(format!(
+                    "field {}×{} → {}×{}",
+                    rendered.field.width(),
+                    rendered.field.height(),
+                    rendered.field.output_width(),
+                    rendered.field.output_height(),
+                ));
+            }
+            self.timing_labels(ui);
             ui.separator();
 
             // The splat path is the documented counter-example, never a
@@ -612,5 +648,24 @@ impl Gpu {
                 }
             }
         });
+    }
+
+    fn timing_labels(&self, ui: &mut egui::Ui) {
+        ui.label(format!(
+            "advance {:.2} ms, {} substeps",
+            self.timings.field_advance_micros / 1000.0,
+            self.timings.substeps
+        ));
+        if !self.timings.gpu_supported {
+            ui.label("no timestamp queries on this adapter");
+            return;
+        }
+        for (label, micros) in READOUT_PASSES.iter().zip(&self.timings.readout) {
+            ui.label(format!("  {label}: {micros:.1} µs"));
+        }
+        ui.label(format!(
+            "  readout total: {:.1} µs",
+            self.timings.readout_total_micros()
+        ));
     }
 }

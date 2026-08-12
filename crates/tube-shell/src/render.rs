@@ -6,7 +6,7 @@
 use std::path::Path;
 
 use beam_trace::{Sample, Trace, TraceHeader};
-use tube_renderer::{DepositMode, Field, FieldShaders, TubeParams};
+use tube_renderer::{DepositMode, Field, FieldShaders, READOUT_PASSES, TubeParams, View};
 
 use crate::gpu;
 use crate::shaders::{ShaderLibrary, shader_dir};
@@ -23,6 +23,7 @@ pub struct RenderOptions {
     pub out: std::path::PathBuf,
     pub sim_seconds: Option<f64>,
     pub frame_hz: f64,
+    pub view: View,
 }
 
 pub fn render(options: &RenderOptions) -> Result<(), String> {
@@ -44,6 +45,7 @@ pub fn render(options: &RenderOptions) -> Result<(), String> {
 
     let mut field = Field::new(
         &device,
+        &queue,
         DISPLAY_HEIGHT,
         TubeParams::default(),
         FieldShaders {
@@ -51,9 +53,12 @@ pub fn render(options: &RenderOptions) -> Result<(), String> {
             splat: source("deposit_splat.wgsl")?,
             resolve: source("deposit_resolve.wgsl")?,
             phosphor: source("phosphor.wgsl")?,
+            deposit_total: source("deposit_total.wgsl")?,
             readout: source("readout.wgsl")?,
             blur: source("blur.wgsl")?,
             tonemap: source("tonemap.wgsl")?,
+            view: source("view.wgsl")?,
+            sample_points: source("sample_points.wgsl")?,
         },
         0.0,
     );
@@ -76,7 +81,7 @@ pub fn render(options: &RenderOptions) -> Result<(), String> {
             DepositMode::Analytic,
         );
     }
-    field.render(&device, &queue);
+    let timings = field.render(&device, &queue, options.view, &trace.samples);
 
     let image = field.readout().read_back(&device, &queue);
     let width = field.output_width();
@@ -95,13 +100,39 @@ pub fn render(options: &RenderOptions) -> Result<(), String> {
         "{duration:.3} s at {} Hz: {frames} frames, {substeps} substeps",
         options.frame_hz
     );
-    println!("{width}x{height}: {lit} non-black pixels");
+    println!(
+        "{width}x{height}, view {}: {lit} non-black pixels",
+        options.view.name()
+    );
+    print_timings(&timings);
     println!("wrote {}", options.out.display());
 
     if lit == 0 {
         return Err("the render is entirely black".to_owned());
     }
     Ok(())
+}
+
+fn print_timings(timings: &tube_renderer::Timings) {
+    println!(
+        "field advance: {:.2} ms wall clock over {} substeps",
+        timings.field_advance_micros / 1000.0,
+        timings.substeps
+    );
+    if !timings.gpu_supported {
+        println!("readout passes: no timestamp queries on this adapter");
+        return;
+    }
+    let per_pass: Vec<String> = READOUT_PASSES
+        .iter()
+        .zip(&timings.readout)
+        .map(|(label, micros)| format!("{label} {micros:.1}"))
+        .collect();
+    println!(
+        "readout passes (us): {} | total {:.1}",
+        per_pass.join(", "),
+        timings.readout_total_micros()
+    );
 }
 
 /// A short trace exercising a slow stroke, a fast stroke, a parked dot and a
