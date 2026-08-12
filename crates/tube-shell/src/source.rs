@@ -12,7 +12,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use beam_sources::{AudioPlayer, Lissajous, PATTERNS, XyAudio};
-use beam_trace::{RingBuffer, Sample};
+use beam_trace::{RingBuffer, Sample, TraceHeader};
+use std::path::Path;
 
 /// How far ahead of the wall clock the producer is allowed to generate. Enough
 /// that a scheduling hiccup does not starve the renderer, short enough that a
@@ -34,6 +35,10 @@ pub enum Source {
     Pattern(usize),
     /// An oscilloscope-music WAV, clocked by the audio device.
     Audio,
+    /// A recorded `.btr0`, looped. This is the shader-iteration workflow:
+    /// replay plus hot-reload plus the debug views (FIRST-SLICE.md §1
+    /// deliverable 6).
+    Replay,
 }
 
 impl Source {
@@ -42,6 +47,7 @@ impl Source {
             Source::Lissajous => "lissajous".to_owned(),
             Source::Pattern(index) => PATTERNS[index].slug.to_owned(),
             Source::Audio => "xy audio".to_owned(),
+            Source::Replay => "replay".to_owned(),
         }
     }
 }
@@ -56,6 +62,8 @@ pub struct Controls {
     pub audio_drive_path: String,
     /// Constant drive for files that carry no drive channel.
     pub audio_drive: f32,
+    /// The `.btr0` to loop.
+    pub replay_path: String,
     /// Bumped when the source changes, so the producer knows to drop whatever
     /// it had queued and start again from the present.
     pub generation: u64,
@@ -69,6 +77,7 @@ impl Default for Controls {
             audio_path: String::new(),
             audio_drive_path: String::new(),
             audio_drive: 1.0,
+            replay_path: String::new(),
             generation: 0,
         }
     }
@@ -82,8 +91,9 @@ impl Controls {
     /// boundary rather than tearing a figure in half.
     fn chunk(&self) -> (Vec<Sample>, f32) {
         match self.source {
-            // Audio is clocked by the device, not generated in chunks.
-            Source::Audio => (Vec::new(), 0.01),
+            // These two are not generated: audio is clocked by the device and
+            // replay comes off disk, both handled in the producer.
+            Source::Audio | Source::Replay => (Vec::new(), 0.01),
             Source::Pattern(index) => PATTERNS[index].frame(),
             Source::Lissajous => {
                 let figure = self.lissajous;
@@ -173,6 +183,75 @@ impl LiveSource {
     pub fn buffered(&self) -> usize {
         self.ring.lock().expect("ring lock").len()
     }
+
+    /// Dump whatever the ring currently holds to a `.btr0`.
+    ///
+    /// The write is a raw copy of the sample array plus a header — on-disk is
+    /// the in-memory layout by design (TRACE-FORMAT.md §6), so capturing a
+    /// regression trace really is a memcpy and a write.
+    ///
+    /// Timestamps are rebased so the file starts near zero. Session time can
+    /// run to minutes, and f32 `t` loses resolution out there; the epoch field
+    /// exists precisely so a file need not carry that history.
+    pub fn record(&self, path: impl AsRef<Path>, producer: &str) -> Result<usize, String> {
+        let ring = self.ring.lock().expect("ring lock");
+        record_ring(&ring, path, producer)
+    }
+}
+
+/// Write a ring buffer's contents as a `.btr0`.
+///
+/// Timestamps are rebased so the file starts at zero, with the original origin
+/// carried in the header's epoch. Session time runs to minutes and f32 `t`
+/// loses resolution out there; the epoch field exists precisely so a file need
+/// not carry that history (TRACE-FORMAT.md §2).
+pub fn record_ring(
+    ring: &RingBuffer,
+    path: impl AsRef<Path>,
+    producer: &str,
+) -> Result<usize, String> {
+    let samples: Vec<Sample> = (0..ring.len())
+        .filter_map(|index| ring.get(index).copied())
+        .collect();
+    if samples.is_empty() {
+        return Err("the ring buffer is empty; nothing to record".to_owned());
+    }
+
+    let first = samples[0].t;
+    let rebased = rebase(&samples, -first, false);
+
+    let header = TraceHeader {
+        epoch: ring.epoch() + f64::from(first),
+        epsilon: beam_sources::EPSILON,
+        // A live capture has no display list, so no nominal rate to claim.
+        nominal_refresh_hz: 0.0,
+        producer_id: format!("live/{producer}").chars().take(32).collect(),
+    };
+    beam_trace::write_file(path, &header, &rebased).map_err(|e| e.to_string())?;
+    Ok(rebased.len())
+}
+
+/// Offset a whole trace so a repeat of it follows the one before.
+///
+/// `drop_opening` removes the trace's first sample, which is what makes
+/// looping sound: a trace ends where it began, so laying repeat N+1 straight
+/// after repeat N would put two samples on the same instant, and `t` must
+/// strictly increase within a buffer generation (TRACE-FORMAT.md §2). The
+/// opening sample only restates a position the previous repeat already left
+/// the beam at, so dropping it loses nothing.
+pub fn rebase(trace: &[Sample], offset: f32, drop_opening: bool) -> Vec<Sample> {
+    let from = if drop_opening && !trace.is_empty() {
+        1
+    } else {
+        0
+    };
+    trace[from..]
+        .iter()
+        .map(|sample| Sample {
+            t: sample.t + offset,
+            ..*sample
+        })
+        .collect()
 }
 
 impl Drop for LiveSource {
@@ -182,6 +261,16 @@ impl Drop for LiveSource {
             let _ = thread.join();
         }
     }
+}
+
+/// A `.btr0` held open for looping.
+struct Loaded {
+    path: String,
+    samples: Vec<Sample>,
+    seconds: f32,
+    /// False until the first repeat has been emitted, after which each repeat
+    /// drops its opening sample so the joins keep time moving.
+    started: bool,
 }
 
 /// The audio source's state, which lives on the producer thread because a cpal
@@ -205,6 +294,7 @@ fn produce(
     let mut generation = u64::MAX;
     let mut last_t = f32::NEG_INFINITY;
     let mut playing: Option<Playing> = None;
+    let mut loaded: Option<Loaded> = None;
 
     while !stop.load(Ordering::Relaxed) {
         let controls = controls.lock().expect("controls lock").clone();
@@ -221,6 +311,22 @@ fn produce(
         let chunk = if controls.source == Source::Audio {
             match audio_chunk(&mut playing, &controls, status, now) {
                 Some(chunk) => chunk,
+                None => {
+                    std::thread::sleep(IDLE);
+                    continue;
+                }
+            }
+        } else if controls.source == Source::Replay {
+            playing = None;
+            if cursor > now + LOOKAHEAD_SECONDS {
+                std::thread::sleep(IDLE);
+                continue;
+            }
+            match replay_chunk(&mut loaded, &controls, status, cursor) {
+                Some((chunk, seconds)) => {
+                    cursor += f64::from(seconds);
+                    chunk
+                }
                 None => {
                     std::thread::sleep(IDLE);
                     continue;
@@ -261,6 +367,53 @@ fn produce(
             ring.push(sample);
         }
     }
+}
+
+/// One loop of the replayed trace, placed after whatever came before.
+fn replay_chunk(
+    loaded: &mut Option<Loaded>,
+    controls: &Controls,
+    status: &Mutex<String>,
+    cursor: f64,
+) -> Option<(Vec<Sample>, f32)> {
+    let report = |text: String| *status.lock().expect("status lock") = text;
+
+    let path = controls.replay_path.trim();
+    if path.is_empty() {
+        report("give replay a .btr0 to loop".to_owned());
+        return None;
+    }
+    if loaded.as_ref().is_none_or(|held| held.path != path) {
+        match beam_trace::read_file(path) {
+            Ok(trace) if trace.samples.len() < 2 => {
+                report(format!("{path} has too few samples to replay"));
+                return None;
+            }
+            Ok(trace) => {
+                let seconds = trace.samples.last().map_or(0.0, |s| s.t);
+                report(format!(
+                    "{} samples over {seconds:.3} s from {}",
+                    trace.samples.len(),
+                    trace.header.producer_id
+                ));
+                *loaded = Some(Loaded {
+                    path: path.to_owned(),
+                    samples: trace.samples,
+                    seconds,
+                    started: false,
+                });
+            }
+            Err(e) => {
+                report(e.to_string());
+                return None;
+            }
+        }
+    }
+
+    let held = loaded.as_mut()?;
+    let chunk = rebase(&held.samples, cursor as f32, held.started);
+    held.started = true;
+    Some((chunk, held.seconds))
 }
 
 /// Samples for the audio frames the device has actually played.
@@ -346,6 +499,95 @@ mod tests {
 
     /// Long enough for the producer to get several chunks ahead of the clock.
     const SETTLE: Duration = Duration::from_millis(150);
+
+    fn at(t: f32) -> Sample {
+        Sample::mono(t.sin(), t.cos(), 1.0, t)
+    }
+
+    /// Lay a trace end to end, exactly as the producer does one repeat at a
+    /// time: the first repeat whole, every later one without its opening
+    /// sample.
+    fn looped(trace: &[Sample], repeats: usize) -> Vec<Sample> {
+        let seconds = trace.last().map_or(0.0, |sample| sample.t);
+        (0..repeats)
+            .flat_map(|repeat| rebase(trace, repeat as f32 * seconds, repeat > 0))
+            .collect()
+    }
+
+    #[test]
+    fn a_recorded_ring_reloads_byte_identically() {
+        let mut ring = RingBuffer::with_capacity(64, 0.0);
+        let written: Vec<Sample> = (0..32).map(|i| at(i as f32 * 0.001)).collect();
+        ring.extend(&written);
+
+        let path = std::env::temp_dir().join(format!("trexy-record-{}.btr0", std::process::id()));
+        let count = record_ring(&ring, &path, "test").expect("record");
+        let read = beam_trace::read_file(&path).expect("reload");
+        let bytes = std::fs::read(&path).expect("raw bytes");
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(count, written.len());
+        // The first sample is already at t = 0, so rebasing is the identity
+        // here and the round trip must be exact.
+        assert_eq!(read.samples, written);
+        assert_eq!(read.header.producer_id, "live/test");
+        assert_eq!(
+            beam_trace::encode(&read.header, &read.samples).unwrap(),
+            bytes,
+            "re-encoding the file must reproduce it"
+        );
+    }
+
+    #[test]
+    fn recording_carries_the_original_origin_in_the_epoch() {
+        let mut ring = RingBuffer::with_capacity(64, 0.0);
+        // A capture taken a while into the session.
+        let written: Vec<Sample> = (0..8).map(|i| at(120.0 + i as f32 * 0.001)).collect();
+        ring.extend(&written);
+
+        let path = std::env::temp_dir().join(format!("trexy-epoch-{}.btr0", std::process::id()));
+        record_ring(&ring, &path, "test").expect("record");
+        let read = beam_trace::read_file(&path).expect("reload");
+        std::fs::remove_file(&path).ok();
+
+        assert!(
+            (read.header.epoch - 120.0).abs() < 1e-3,
+            "{}",
+            read.header.epoch
+        );
+        assert_eq!(read.samples[0].t, 0.0, "the file starts at its own zero");
+        // And the shape is unchanged: only the origin moved.
+        for (index, sample) in read.samples.iter().enumerate() {
+            assert_eq!(sample.x, written[index].x);
+            assert!((sample.t - (written[index].t - 120.0)).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn looping_a_replay_keeps_time_strictly_increasing() {
+        let trace: Vec<Sample> = (0..16).map(|i| at(i as f32 * 0.002)).collect();
+
+        // Three repeats gives two joins, which is where this can go wrong.
+        let played = looped(&trace, 3);
+        assert_eq!(
+            played.len(),
+            trace.len() * 3 - 2,
+            "each repeat drops its opening"
+        );
+
+        let mut previous = f32::NEG_INFINITY;
+        for (index, sample) in played.iter().enumerate() {
+            assert!(
+                sample.t > previous,
+                "sample {index} went backwards: {} after {previous}",
+                sample.t
+            );
+            previous = sample.t;
+        }
+
+        // And the result is a trace the renderer would accept, joins included.
+        beam_trace::validate(&played).expect("a valid looped trace");
+    }
 
     #[test]
     fn the_producer_fills_the_ring_with_a_valid_trace() {

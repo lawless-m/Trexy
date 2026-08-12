@@ -12,8 +12,9 @@ use tube_renderer::{
     registry,
 };
 use winit::application::ApplicationHandler;
-use winit::event::WindowEvent;
+use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 use crate::gpu;
@@ -38,6 +39,18 @@ struct PanelState<'a> {
     view: &'a mut View,
     params: &'a mut TubeParams,
     status: &'a mut String,
+    /// A capture the panel asked for, acted on after the UI closes its
+    /// borrows.
+    capture: &'a mut Option<Capture>,
+}
+
+/// What the capture buttons and keys ask for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Capture {
+    /// Dump the live ring buffer to a `.btr0`.
+    Trace,
+    /// Write the presented image to a PNG.
+    Screenshot,
 }
 
 /// Everything rebuilt when a shader changes. Held as a unit so a failed
@@ -182,6 +195,13 @@ impl ApplicationHandler for App {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => gpu.resize(size.width, size.height),
             WindowEvent::RedrawRequested => gpu.redraw(&self.shaders, &self.source),
+            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+                match event.physical_key {
+                    PhysicalKey::Code(KeyCode::KeyR) => gpu.record(&self.source),
+                    PhysicalKey::Code(KeyCode::KeyS) => gpu.screenshot(),
+                    _ => {}
+                }
+            }
             _ => {}
         }
     }
@@ -462,6 +482,39 @@ impl Gpu {
         self.built_with = self.params;
     }
 
+    /// Dump the live ring buffer to a timestamped `.btr0`.
+    fn record(&mut self, source: &LiveSource) {
+        let name = source.controls().source.name().replace(' ', "-");
+        let path = PathBuf::from("recordings").join(format!("{}-{}.btr0", name, stamp()));
+        self.profile_status = match source.record(&path, &name) {
+            Ok(count) => format!("recorded {count} samples to {}", path.display()),
+            Err(e) => e,
+        };
+        println!("{}", self.profile_status);
+    }
+
+    /// Write the final presented image to `screenshots/`.
+    fn screenshot(&mut self) {
+        let Some(rendered) = &self.rendered else {
+            return;
+        };
+        let image = rendered
+            .field
+            .readout()
+            .read_back(&self.device, &self.queue);
+        let path = PathBuf::from("screenshots").join(format!("trexy-{}.png", stamp()));
+        self.profile_status = match crate::render::write_png(
+            &path,
+            rendered.field.output_width(),
+            rendered.field.output_height(),
+            &image,
+        ) {
+            Ok(()) => format!("wrote {}", path.display()),
+            Err(e) => e,
+        };
+        println!("{}", self.profile_status);
+    }
+
     /// Letterbox the tube face into the window without distorting it.
     fn present_uniform(&self, rendered: &Rendered) -> PresentUniform {
         let tube = rendered.field.output_width() as f32 / rendered.field.output_height() as f32;
@@ -533,6 +586,7 @@ impl Gpu {
         let mut chosen = self.view;
         let mut params = self.params;
         let mut status = self.profile_status.clone();
+        let mut capture = None;
         let output = self.egui_ctx.clone().run_ui(raw_input, |ui| {
             self.panel(
                 ui,
@@ -543,6 +597,7 @@ impl Gpu {
                     view: &mut chosen,
                     params: &mut params,
                     status: &mut status,
+                    capture: &mut capture,
                 },
             );
         });
@@ -550,6 +605,11 @@ impl Gpu {
         self.splat = splat;
         self.params = params;
         self.profile_status = status;
+        match capture {
+            Some(Capture::Trace) => self.record(source),
+            Some(Capture::Screenshot) => self.screenshot(),
+            None => {}
+        }
         self.egui_state
             .handle_platform_output(&self.window, output.platform_output);
         let paint_jobs = self
@@ -627,6 +687,7 @@ impl Gpu {
         let view = &mut *state.view;
         let params = &mut *state.params;
         let status = &mut *state.status;
+        let capture = &mut *state.capture;
         egui::Panel::left("shell").show(ui, |ui| {
             ui.heading("Trexy");
             ui.label(format!(
@@ -636,6 +697,24 @@ impl Gpu {
             ui.separator();
 
             source_controls(ui, source);
+            ui.separator();
+
+            ui.horizontal(|ui| {
+                if ui
+                    .button("record (R)")
+                    .on_hover_text("dump the ring buffer to recordings/")
+                    .clicked()
+                {
+                    *capture = Some(Capture::Trace);
+                }
+                if ui
+                    .button("screenshot (S)")
+                    .on_hover_text("write the presented image to screenshots/")
+                    .clicked()
+                {
+                    *capture = Some(Capture::Screenshot);
+                }
+            });
             ui.separator();
 
             ui.label("view");
@@ -731,6 +810,7 @@ fn source_controls(ui: &mut egui::Ui, source: &LiveSource) {
                 );
             }
             ui.selectable_value(&mut controls.source, Source::Audio, "xy audio");
+            ui.selectable_value(&mut controls.source, Source::Replay, "replay");
         });
 
     if controls.source == Source::Lissajous {
@@ -743,6 +823,16 @@ fn source_controls(ui: &mut egui::Ui, source: &LiveSource) {
         ui.add(egui::Slider::new(&mut figure.amplitude, 0.1..=1.0).text("amplitude"));
     } else if let Source::Pattern(index) = controls.source {
         ui.label(beam_sources::PATTERNS[index].isolates);
+    } else if controls.source == Source::Replay {
+        ui.label("trace to loop (.btr0)");
+        ui.text_edit_singleline(&mut controls.replay_path);
+        if ui.button("load").clicked() {
+            controls.generation = controls.generation.wrapping_add(1);
+        }
+        let status = source.status();
+        if !status.is_empty() {
+            ui.label(egui::RichText::new(status).small());
+        }
     } else if controls.source == Source::Audio {
         ui.label("XY WAV (left → x, right → y)");
         ui.text_edit_singleline(&mut controls.audio_path);
@@ -776,6 +866,15 @@ fn matches_controls(a: &Controls, b: &Controls) -> bool {
         && a.audio_path == b.audio_path
         && a.audio_drive_path == b.audio_drive_path
         && a.audio_drive == b.audio_drive
+        && a.replay_path == b.replay_path
+}
+
+/// Seconds since the Unix epoch, for naming captures. Enough to keep a
+/// session's files in order and distinct.
+fn stamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// Every RENDERER.md §4 parameter, grouped by provenance class.
