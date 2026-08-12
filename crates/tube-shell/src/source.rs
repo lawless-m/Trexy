@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use beam_sources::{Lissajous, PATTERNS};
+use beam_sources::{AudioPlayer, Lissajous, PATTERNS, XyAudio};
 use beam_trace::{RingBuffer, Sample};
 
 /// How far ahead of the wall clock the producer is allowed to generate. Enough
@@ -32,6 +32,8 @@ pub enum Source {
     Lissajous,
     /// One of the seven acceptance patterns, by index into `PATTERNS`.
     Pattern(usize),
+    /// An oscilloscope-music WAV, clocked by the audio device.
+    Audio,
 }
 
 impl Source {
@@ -39,15 +41,21 @@ impl Source {
         match self {
             Source::Lissajous => "lissajous".to_owned(),
             Source::Pattern(index) => PATTERNS[index].slug.to_owned(),
+            Source::Audio => "xy audio".to_owned(),
         }
     }
 }
 
 /// Everything the panel can change while the source runs.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Controls {
     pub source: Source,
     pub lissajous: Lissajous,
+    /// WAV to play. A second path, if given, is a mono drive envelope.
+    pub audio_path: String,
+    pub audio_drive_path: String,
+    /// Constant drive for files that carry no drive channel.
+    pub audio_drive: f32,
     /// Bumped when the source changes, so the producer knows to drop whatever
     /// it had queued and start again from the present.
     pub generation: u64,
@@ -58,6 +66,9 @@ impl Default for Controls {
         Self {
             source: Source::Lissajous,
             lissajous: Lissajous::default(),
+            audio_path: String::new(),
+            audio_drive_path: String::new(),
+            audio_drive: 1.0,
             generation: 0,
         }
     }
@@ -71,6 +82,8 @@ impl Controls {
     /// boundary rather than tearing a figure in half.
     fn chunk(&self) -> (Vec<Sample>, f32) {
         match self.source {
+            // Audio is clocked by the device, not generated in chunks.
+            Source::Audio => (Vec::new(), 0.01),
             Source::Pattern(index) => PATTERNS[index].frame(),
             Source::Lissajous => {
                 let figure = self.lissajous;
@@ -90,6 +103,8 @@ pub struct LiveSource {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     start: Instant,
+    /// Whatever the audio source has to say for itself, for the panel.
+    status: Arc<Mutex<String>>,
 }
 
 impl LiveSource {
@@ -97,6 +112,7 @@ impl LiveSource {
         let ring = Arc::new(Mutex::new(RingBuffer::with_capacity(CAPACITY, 0.0)));
         let controls = Arc::new(Mutex::new(Controls::default()));
         let stop = Arc::new(AtomicBool::new(false));
+        let status = Arc::new(Mutex::new(String::new()));
         let start = Instant::now();
 
         let thread = std::thread::Builder::new()
@@ -105,7 +121,8 @@ impl LiveSource {
                 let ring = Arc::clone(&ring);
                 let controls = Arc::clone(&controls);
                 let stop = Arc::clone(&stop);
-                move || produce(&ring, &controls, &stop, start)
+                let status = Arc::clone(&status);
+                move || produce(&ring, &controls, &stop, &status, start)
             })
             .expect("spawn the producer thread");
 
@@ -115,6 +132,7 @@ impl LiveSource {
             stop,
             thread: Some(thread),
             start,
+            status,
         }
     }
 
@@ -125,7 +143,13 @@ impl LiveSource {
     }
 
     pub fn controls(&self) -> Controls {
-        *self.controls.lock().expect("controls lock")
+        self.controls.lock().expect("controls lock").clone()
+    }
+
+    /// What the audio source last reported: what it loaded, or why it could
+    /// not.
+    pub fn status(&self) -> String {
+        self.status.lock().expect("status lock").clone()
     }
 
     pub fn set_controls(&self, controls: Controls) {
@@ -160,18 +184,30 @@ impl Drop for LiveSource {
     }
 }
 
+/// The audio source's state, which lives on the producer thread because a cpal
+/// stream is not `Send` on every platform.
+struct Playing {
+    player: AudioPlayer,
+    /// Trace time at which the stream started.
+    epoch: f64,
+    /// Track frames already turned into samples.
+    cursor: usize,
+}
+
 fn produce(
     ring: &Mutex<RingBuffer>,
     controls: &Mutex<Controls>,
     stop: &AtomicBool,
+    status: &Mutex<String>,
     start: Instant,
 ) {
     let mut cursor = 0.0f64;
     let mut generation = u64::MAX;
     let mut last_t = f32::NEG_INFINITY;
+    let mut playing: Option<Playing> = None;
 
     while !stop.load(Ordering::Relaxed) {
-        let controls = *controls.lock().expect("controls lock");
+        let controls = controls.lock().expect("controls lock").clone();
         let now = start.elapsed().as_secs_f64();
 
         if controls.generation != generation {
@@ -179,31 +215,129 @@ fn produce(
             // from the present instant.
             generation = controls.generation;
             cursor = cursor.max(now);
+            playing = None;
         }
 
-        if cursor > now + LOOKAHEAD_SECONDS {
+        let chunk = if controls.source == Source::Audio {
+            match audio_chunk(&mut playing, &controls, status, now) {
+                Some(chunk) => chunk,
+                None => {
+                    std::thread::sleep(IDLE);
+                    continue;
+                }
+            }
+        } else {
+            playing = None;
+            if cursor > now + LOOKAHEAD_SECONDS {
+                std::thread::sleep(IDLE);
+                continue;
+            }
+            let (chunk, seconds) = controls.chunk();
+            cursor += f64::from(seconds);
+            // Synthetic chunks are timestamped from zero and placed here.
+            chunk
+                .into_iter()
+                .map(|mut sample| {
+                    sample.t += (cursor - f64::from(seconds)) as f32;
+                    sample
+                })
+                .collect()
+        };
+
+        if chunk.is_empty() {
             std::thread::sleep(IDLE);
             continue;
         }
 
-        let (chunk, seconds) = controls.chunk();
-        {
-            let mut ring = ring.lock().expect("ring lock");
-            for sample in chunk {
-                let mut sample = sample;
-                sample.t += cursor as f32;
-                // Chunks abut, so the first sample of one lands on the last of
-                // the previous. `t` must strictly increase (TRACE-FORMAT.md §2)
-                // and the duplicate carries no new information, so nudge it.
-                if sample.t <= last_t {
-                    sample.t = f32::from_bits(last_t.to_bits() + 1);
-                }
-                last_t = sample.t;
-                ring.push(sample);
+        let mut ring = ring.lock().expect("ring lock");
+        for mut sample in chunk {
+            // Chunks abut, so the first sample of one lands on the last of the
+            // previous. `t` must strictly increase (TRACE-FORMAT.md §2) and the
+            // duplicate carries no new information, so nudge it.
+            if sample.t <= last_t {
+                sample.t = f32::from_bits(last_t.to_bits() + 1);
+            }
+            last_t = sample.t;
+            ring.push(sample);
+        }
+    }
+}
+
+/// Samples for the audio frames the device has actually played.
+///
+/// Timestamps come from the audio clock, never the wall clock: the beam is
+/// slaved to the sound rather than racing it. The beam therefore lags the
+/// speakers by one producer poll, which is milliseconds — well inside the
+/// 30 ms that acceptance pattern 8 allows.
+fn audio_chunk(
+    playing: &mut Option<Playing>,
+    controls: &Controls,
+    status: &Mutex<String>,
+    now: f64,
+) -> Option<Vec<Sample>> {
+    let report = |text: String| *status.lock().expect("status lock") = text;
+
+    if playing.is_none() {
+        if controls.audio_path.trim().is_empty() {
+            report("give the audio source a WAV to play".to_owned());
+            return None;
+        }
+        let track = if controls.audio_drive_path.trim().is_empty() {
+            XyAudio::load(&controls.audio_path)
+        } else {
+            XyAudio::load_pair(&controls.audio_path, &controls.audio_drive_path)
+        };
+        let track = match track {
+            Ok(track) if track.is_empty() => {
+                report("that file has no audio in it".to_owned());
+                return None;
+            }
+            Ok(track) => track,
+            Err(e) => {
+                report(e);
+                return None;
+            }
+        };
+        let summary = format!(
+            "{:.1} s at {} Hz, drive {}",
+            track.seconds(),
+            track.sample_rate(),
+            if track.has_drive_channel() {
+                "from the file"
+            } else {
+                "from the slider"
+            }
+        );
+        match AudioPlayer::start(track, controls.audio_drive) {
+            Ok(player) => {
+                report(summary);
+                *playing = Some(Playing {
+                    player,
+                    epoch: now,
+                    cursor: 0,
+                });
+            }
+            Err(e) => {
+                report(e);
+                return None;
             }
         }
-        cursor += f64::from(seconds);
     }
+
+    let playing = playing.as_mut()?;
+    playing.player.set_drive(controls.audio_drive);
+
+    let played = playing.player.played_track_frames();
+    if played <= playing.cursor {
+        return Some(Vec::new());
+    }
+    let samples =
+        playing
+            .player
+            .track()
+            .samples(playing.cursor, played, controls.audio_drive, playing.epoch);
+    playing.cursor = played;
+    Some(samples)
 }
 
 #[cfg(test)]

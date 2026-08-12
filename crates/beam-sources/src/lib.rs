@@ -6,10 +6,12 @@
 //! all the same, so the renderer is never tuned against traces no real
 //! producer would emit.
 
+pub mod audio;
 pub mod lissajous;
 pub mod patterns;
 pub mod pen;
 
+pub use audio::{AudioPlayer, XyAudio};
 pub use lissajous::Lissajous;
 pub use patterns::{EPSILON, PATTERNS, Pattern};
 pub use pen::Pen;

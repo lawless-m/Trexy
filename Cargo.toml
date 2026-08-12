@@ -36,6 +36,11 @@ naga = { version = "30.0", features = ["wgsl-in"] }
 notify = "8.2"
 pollster = "1.0"
 
+# Oscilloscope-music playback: hound decodes the WAV, cpal owns the clock the
+# beam is slaved to.
+cpal = "0.18"
+hound = "3.5"
+
 bytemuck = { version = "1.25", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = ["png"] }

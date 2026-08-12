@@ -8,3 +8,5 @@ repository.workspace = true
 
 [dependencies]
 beam-trace.workspace = true
+cpal.workspace = true
+hound.workspace = true

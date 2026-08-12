@@ -716,7 +716,7 @@ impl Gpu {
 /// (FIRST-SLICE.md §1 deliverable 4).
 fn source_controls(ui: &mut egui::Ui, source: &LiveSource) {
     let mut controls = source.controls();
-    let before = controls;
+    let before = controls.clone();
 
     ui.label("source");
     egui::ComboBox::from_id_salt("source")
@@ -730,6 +730,7 @@ fn source_controls(ui: &mut egui::Ui, source: &LiveSource) {
                     format!("{}. {}", pattern.number, pattern.slug),
                 );
             }
+            ui.selectable_value(&mut controls.source, Source::Audio, "xy audio");
         });
 
     if controls.source == Source::Lissajous {
@@ -742,6 +743,19 @@ fn source_controls(ui: &mut egui::Ui, source: &LiveSource) {
         ui.add(egui::Slider::new(&mut figure.amplitude, 0.1..=1.0).text("amplitude"));
     } else if let Source::Pattern(index) = controls.source {
         ui.label(beam_sources::PATTERNS[index].isolates);
+    } else if controls.source == Source::Audio {
+        ui.label("XY WAV (left → x, right → y)");
+        ui.text_edit_singleline(&mut controls.audio_path);
+        ui.label("optional mono drive file");
+        ui.text_edit_singleline(&mut controls.audio_drive_path);
+        ui.add(egui::Slider::new(&mut controls.audio_drive, 0.0..=4.0).text("drive"));
+        if ui.button("play").clicked() {
+            controls.generation = controls.generation.wrapping_add(1);
+        }
+        let status = source.status();
+        if !status.is_empty() {
+            ui.label(egui::RichText::new(status).small());
+        }
     }
 
     ui.label(format!("{} samples buffered", source.buffered()));
@@ -756,7 +770,12 @@ fn source_controls(ui: &mut egui::Ui, source: &LiveSource) {
 }
 
 fn matches_controls(a: &Controls, b: &Controls) -> bool {
-    a.source == b.source && a.lissajous == b.lissajous && a.generation == b.generation
+    a.source == b.source
+        && a.lissajous == b.lissajous
+        && a.generation == b.generation
+        && a.audio_path == b.audio_path
+        && a.audio_drive_path == b.audio_drive_path
+        && a.audio_drive == b.audio_drive
 }
 
 /// Every RENDERER.md §4 parameter, grouped by provenance class.
