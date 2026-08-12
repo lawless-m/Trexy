@@ -15,10 +15,11 @@ tube-shell — vector tube renderer
 
     tube-shell                              open the window
     tube-shell --self-check                 probe the GPU headlessly and exit
-    tube-shell --headless-debug --out FILE [--debug-splat] [--check-beading]
+    tube-shell --headless-debug --out FILE [options]
 
   --debug-splat    select the forbidden point-splat path (reference only)
   --check-beading  measure evenness along a fast stroke; PASS/FAIL
+  --sim-ms N       draw, then decay for N ms and check both rates; PASS/FAIL
 ";
 
 fn main() -> ExitCode {
@@ -63,6 +64,14 @@ fn parse_debug(rest: &[String]) -> Result<(PathBuf, DebugOptions), String> {
             }
             "--debug-splat" => options.splat = true,
             "--check-beading" => options.check_beading = true,
+            "--sim-ms" => {
+                let value = args.next().ok_or("--sim-ms needs a number".to_owned())?;
+                options.sim_ms = Some(
+                    value
+                        .parse()
+                        .map_err(|_| format!("--sim-ms {value} is not a number"))?,
+                );
+            }
             other => return Err(format!("unknown argument {other}\n\n{USAGE}")),
         }
     }

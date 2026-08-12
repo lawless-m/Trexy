@@ -4,5 +4,12 @@
 //! Specified in RENDERER.md.
 
 pub mod deposit;
+pub mod frame;
+pub mod phosphor;
+mod readback;
+pub mod substep;
 
 pub use deposit::{Deposit, DepositMode, DepositParams, DepositShaders, SUPERSAMPLE, TubeProfile};
+pub use frame::{Field, FieldShaders};
+pub use phosphor::{Component, Phosphor, PhosphorParams};
+pub use substep::{SUBSTEP_SECONDS, Substep, SubstepClock, clip_spans};

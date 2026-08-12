@@ -1,10 +1,13 @@
 //! Headless debug dumps: deposit hardcoded spans with no window and write the
 //! result as a PNG, so the deposition pass is mechanically verifiable.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use beam_trace::{Sample, flags};
-use tube_renderer::{Deposit, DepositMode, DepositParams, DepositShaders, TubeProfile};
+use tube_renderer::{
+    Component, Deposit, DepositMode, DepositParams, DepositShaders, Field, FieldShaders,
+    PhosphorParams, TubeProfile,
+};
 
 use crate::gpu;
 use crate::shaders::{ShaderLibrary, shader_dir};
@@ -27,7 +30,18 @@ pub struct DebugOptions {
     pub splat: bool,
     /// Measure evenness along a fast stroke's centreline and PASS/FAIL on it.
     pub check_beading: bool,
+    /// Deposit the debug spans, then advance this many milliseconds with
+    /// nothing further to deposit, and check the two decay rates.
+    pub sim_ms: Option<f64>,
 }
+
+/// The debug spans end here; everything after is pure decay.
+const TRACE_END: f64 = 0.007;
+
+/// The fast component must be all but gone after the simulated interval.
+const FAST_MUST_LOSE: f32 = 0.99;
+/// The slow component must still be substantially there.
+const SLOW_MUST_KEEP: f32 = 0.90;
 
 /// Two horizontal strokes at the same drive, one swept four times slower than
 /// the other. Dwell time is the whole point of the analytic integral, so the
@@ -111,6 +125,10 @@ pub fn debug(out: &Path, options: DebugOptions) -> Result<(), String> {
         println!("DEBUG: point-splat path selected — this is the counter-example");
     }
 
+    if let Some(sim_ms) = options.sim_ms {
+        return simulate_decay(&device, &queue, &shaders, &dir, out, sim_ms, mode);
+    }
+
     if options.check_beading {
         return check_beading(&device, &queue, &mut deposit, out, mode);
     }
@@ -154,6 +172,119 @@ pub fn debug(out: &Path, options: DebugOptions) -> Result<(), String> {
         return Err("nothing was deposited".to_owned());
     }
     Ok(())
+}
+
+/// Deposit the debug spans, then let the tube sit dark for `sim_ms` and see
+/// what each component has left.
+///
+/// The two time constants are three orders of magnitude apart, so this is the
+/// sharpest possible check that they are genuinely separate buffers with
+/// separate decay and not one smeared average: over a single 1.25 ms substep
+/// the fast component loses essentially everything while the slow one barely
+/// notices.
+fn simulate_decay(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    shaders: &ShaderLibrary,
+    dir: &Path,
+    out: &Path,
+    sim_ms: f64,
+    mode: DepositMode,
+) -> Result<(), String> {
+    let source = |name: &str| {
+        shaders
+            .get(name)
+            .ok_or_else(|| format!("{}/{name} is missing", dir.display()))
+    };
+    let mut field = Field::new(
+        device,
+        DISPLAY_HEIGHT,
+        TubeProfile::default(),
+        DepositParams::default(),
+        PhosphorParams::default(),
+        FieldShaders {
+            deposit: source("deposit.wgsl")?,
+            splat: source("deposit_splat.wgsl")?,
+            resolve: source("deposit_resolve.wgsl")?,
+            phosphor: source("phosphor.wgsl")?,
+        },
+        0.0,
+    );
+    field.clear(device, queue);
+
+    let samples = hardcoded_spans();
+    let drawn = field.advance(device, queue, &samples, TRACE_END, mode);
+    let fast_before = brightest(&field.read_back(device, queue, Component::Fast));
+    let slow_before = brightest(&field.read_back(device, queue, Component::Slow));
+
+    // Nothing to deposit from here: the field only decays.
+    let dark = field.advance(device, queue, &[], TRACE_END + sim_ms / 1000.0, mode);
+    let fast = field.read_back(device, queue, Component::Fast);
+    let slow = field.read_back(device, queue, Component::Slow);
+    let fast_after = brightest(&fast);
+    let slow_after = brightest(&slow);
+
+    let combined: Vec<[f32; 4]> = fast
+        .iter()
+        .zip(slow.iter())
+        .map(|(f, s)| std::array::from_fn(|c| f[c] + s[c]))
+        .collect();
+    let (width, height) = (field.width(), field.height());
+    write_png(out, width, height, &combined, brightest(&combined))?;
+    write_png(&with_suffix(out, "fast"), width, height, &fast, fast_before)?;
+    write_png(&with_suffix(out, "slow"), width, height, &slow, slow_before)?;
+
+    let kept = |after: f32, before: f32| if before > 0.0 { after / before } else { 0.0 };
+    let fast_kept = kept(fast_after, fast_before);
+    let slow_kept = kept(slow_after, slow_before);
+
+    println!(
+        "{drawn} substeps drawing, then {dark} dark ({sim_ms} ms requested, \
+         {:.2} ms simulated)",
+        dark as f64 * tube_renderer::SUBSTEP_SECONDS * 1000.0
+    );
+    println!(
+        "fast {fast_before:.6} -> {fast_after:.6}  ({:.4}% kept)",
+        fast_kept * 100.0
+    );
+    println!(
+        "slow {slow_before:.6} -> {slow_after:.6}  ({:.2}% kept)",
+        slow_kept * 100.0
+    );
+    println!(
+        "wrote {}, {}, {}",
+        out.display(),
+        with_suffix(out, "fast").display(),
+        with_suffix(out, "slow").display()
+    );
+
+    let mut failures = Vec::new();
+    if fast_kept > 1.0 - FAST_MUST_LOSE {
+        failures.push(format!(
+            "fast kept {:.4}%, must lose at least {:.0}%",
+            fast_kept * 100.0,
+            FAST_MUST_LOSE * 100.0
+        ));
+    }
+    if slow_kept < SLOW_MUST_KEEP {
+        failures.push(format!(
+            "slow kept {:.2}%, must keep at least {:.0}%",
+            slow_kept * 100.0,
+            SLOW_MUST_KEEP * 100.0
+        ));
+    }
+    if failures.is_empty() {
+        println!("PASS: two-rate decay behaves as specified");
+        Ok(())
+    } else {
+        Err(format!("FAIL: {}", failures.join("; ")))
+    }
+}
+
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+    let extension = path.extension().unwrap_or_default().to_string_lossy();
+    path.with_file_name(format!("{stem}-{suffix}.{extension}"))
 }
 
 /// Render one fast stroke and measure how even it is along its centreline.
