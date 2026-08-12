@@ -5,4 +5,4 @@
 
 pub mod deposit;
 
-pub use deposit::{Deposit, DepositParams, SUPERSAMPLE, TubeProfile};
+pub use deposit::{Deposit, DepositMode, DepositParams, DepositShaders, SUPERSAMPLE, TubeProfile};

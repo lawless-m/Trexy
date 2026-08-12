@@ -8,12 +8,17 @@ mod shaders;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use headless::DebugOptions;
+
 const USAGE: &str = "\
 tube-shell — vector tube renderer
 
     tube-shell                              open the window
     tube-shell --self-check                 probe the GPU headlessly and exit
-    tube-shell --headless-debug --out FILE  deposit the debug spans to a PNG
+    tube-shell --headless-debug --out FILE [--debug-splat] [--check-beading]
+
+  --debug-splat    select the forbidden point-splat path (reference only)
+  --check-beading  measure evenness along a fast stroke; PASS/FAIL
 ";
 
 fn main() -> ExitCode {
@@ -22,10 +27,9 @@ fn main() -> ExitCode {
     let result = match args.first().map(String::as_str) {
         None => app::run().map_err(|e| e.to_string()),
         Some("--self-check") => gpu::self_check(),
-        Some("--headless-debug") => match parse_out(&args[1..]) {
-            Ok(out) => headless::debug(&out),
-            Err(e) => Err(e),
-        },
+        Some("--headless-debug") => {
+            parse_debug(&args[1..]).and_then(|(out, options)| headless::debug(&out, options))
+        }
         Some("--help" | "-h") => {
             print!("{USAGE}");
             return ExitCode::SUCCESS;
@@ -45,9 +49,24 @@ fn main() -> ExitCode {
     }
 }
 
-fn parse_out(rest: &[String]) -> Result<PathBuf, String> {
-    match rest {
-        [flag, path] if flag == "--out" => Ok(PathBuf::from(path)),
-        _ => Err(format!("--headless-debug needs --out FILE\n\n{USAGE}")),
+fn parse_debug(rest: &[String]) -> Result<(PathBuf, DebugOptions), String> {
+    let mut out = None;
+    let mut options = DebugOptions::default();
+    let mut args = rest.iter();
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--out" => {
+                out = Some(PathBuf::from(
+                    args.next().ok_or("--out needs a path".to_owned())?,
+                ));
+            }
+            "--debug-splat" => options.splat = true,
+            "--check-beading" => options.check_beading = true,
+            other => return Err(format!("unknown argument {other}\n\n{USAGE}")),
+        }
     }
+
+    let out = out.ok_or_else(|| format!("--headless-debug needs --out FILE\n\n{USAGE}"))?;
+    Ok((out, options))
 }

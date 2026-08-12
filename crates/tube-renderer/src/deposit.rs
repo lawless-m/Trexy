@@ -71,6 +71,26 @@ impl DepositParams {
     }
 }
 
+/// WGSL sources for the pass. Passed in rather than embedded so the shell's
+/// hot-reload owns them.
+pub struct DepositShaders<'a> {
+    pub deposit: &'a str,
+    pub splat: &'a str,
+    pub resolve: &'a str,
+}
+
+/// How a span becomes energy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DepositMode {
+    /// Closed-form integration along the span. The only production path.
+    #[default]
+    Analytic,
+    /// Debug only: the forbidden point splat, kept as the reference for what
+    /// beading looks like (CONTENTS.md, FIRST-SLICE.md §4). Nothing selects
+    /// this but an explicit debug flag.
+    Splat,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct GpuParams {
@@ -126,6 +146,7 @@ pub struct Deposit {
 
     deposit_layout: wgpu::BindGroupLayout,
     deposit_pipeline: wgpu::ComputePipeline,
+    splat_pipeline: wgpu::ComputePipeline,
     resolve_bind_group: wgpu::BindGroup,
     resolve_pipeline: wgpu::ComputePipeline,
 }
@@ -138,8 +159,7 @@ impl Deposit {
         display_height: u32,
         profile: TubeProfile,
         params: DepositParams,
-        deposit_source: &str,
-        resolve_source: &str,
+        shaders: DepositShaders<'_>,
     ) -> Self {
         let height = (display_height * SUPERSAMPLE).max(1);
         let width = ((height as f32 * profile.aspect_w / profile.aspect_h).round() as u32).max(1);
@@ -216,7 +236,14 @@ impl Deposit {
                 storage_entry(3, false),
             ],
         });
-        let deposit_pipeline = compute_pipeline(device, "deposit", deposit_source, &deposit_layout);
+        let deposit_pipeline =
+            compute_pipeline(device, "deposit", shaders.deposit, &deposit_layout);
+        let splat_pipeline = compute_pipeline(
+            device,
+            "deposit splat (debug)",
+            shaders.splat,
+            &deposit_layout,
+        );
 
         let resolve_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("deposit resolve"),
@@ -236,7 +263,7 @@ impl Deposit {
             ],
         });
         let resolve_pipeline =
-            compute_pipeline(device, "deposit resolve", resolve_source, &resolve_layout);
+            compute_pipeline(device, "deposit resolve", shaders.resolve, &resolve_layout);
         let resolve_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("deposit resolve"),
             layout: &resolve_layout,
@@ -270,6 +297,7 @@ impl Deposit {
             samples_capacity,
             deposit_layout,
             deposit_pipeline,
+            splat_pipeline,
             resolve_bind_group,
             resolve_pipeline,
         }
@@ -289,7 +317,16 @@ impl Deposit {
 
     /// Clear the accumulator and deposit every span of `samples` into it, then
     /// resolve into `deposit_scratch`.
-    pub fn run(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, samples: &[Sample]) {
+    ///
+    /// `mode` is [`DepositMode::Analytic`] for every render that matters;
+    /// [`DepositMode::Splat`] is reachable only from a debug flag.
+    pub fn run(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        samples: &[Sample],
+        mode: DepositMode,
+    ) {
         let dispatches = self.plan(samples);
         self.upload(device, queue, samples, &dispatches);
 
@@ -329,7 +366,10 @@ impl Deposit {
                 label: Some("deposit"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.deposit_pipeline);
+            pass.set_pipeline(match mode {
+                DepositMode::Analytic => &self.deposit_pipeline,
+                DepositMode::Splat => &self.splat_pipeline,
+            });
             for (index, dispatch) in dispatches.iter().enumerate() {
                 let offset = (index as u64 * UNIFORM_ALIGNMENT) as u32;
                 pass.set_bind_group(0, &bind_group, &[offset]);

@@ -8,7 +8,7 @@ use std::sync::mpsc::{Receiver, channel};
 
 use bytemuck::{Pod, Zeroable};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
-use tube_renderer::{Deposit, DepositParams, TubeProfile};
+use tube_renderer::{Deposit, DepositMode, DepositParams, DepositShaders, TubeProfile};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -19,6 +19,7 @@ use crate::headless::{DISPLAY_HEIGHT, hardcoded_spans};
 use crate::shaders::{ShaderLibrary, shader_dir};
 
 const DEPOSIT_SHADER: &str = "deposit.wgsl";
+const SPLAT_SHADER: &str = "deposit_splat.wgsl";
 const RESOLVE_SHADER: &str = "deposit_resolve.wgsl";
 const PRESENT_SHADER: &str = "present.wgsl";
 
@@ -53,6 +54,8 @@ struct Gpu {
     /// `None` until a shader set validates; kept across a bad edit.
     rendered: Option<Rendered>,
     rendered_generation: Option<u64>,
+    /// Debug toggle for the forbidden point-splat path (FIRST-SLICE.md §4).
+    splat: bool,
 
     egui_ctx: egui::Context,
     egui_state: egui_winit::State,
@@ -285,6 +288,7 @@ impl Gpu {
             present_layout,
             rendered: None,
             rendered_generation: None,
+            splat: false,
             egui_ctx,
             egui_state,
             egui_renderer,
@@ -308,8 +312,9 @@ impl Gpu {
         if self.rendered_generation == Some(shaders.generation()) {
             return;
         }
-        let (Some(deposit_source), Some(resolve_source), Some(present_source)) = (
+        let (Some(deposit_source), Some(splat_source), Some(resolve_source), Some(present_source)) = (
             shaders.get(DEPOSIT_SHADER),
+            shaders.get(SPLAT_SHADER),
             shaders.get(RESOLVE_SHADER),
             shaders.get(PRESENT_SHADER),
         ) else {
@@ -325,10 +330,13 @@ impl Gpu {
             DISPLAY_HEIGHT,
             TubeProfile::default(),
             DepositParams::default(),
-            deposit_source,
-            resolve_source,
+            DepositShaders {
+                deposit: deposit_source,
+                splat: splat_source,
+                resolve: resolve_source,
+            },
         );
-        deposit.run(&self.device, &self.queue, &hardcoded_spans());
+        deposit.run(&self.device, &self.queue, &hardcoded_spans(), self.mode());
 
         let module = self
             .device
@@ -407,6 +415,33 @@ impl Gpu {
         self.rendered_generation = Some(shaders.generation());
     }
 
+    fn mode(&self) -> DepositMode {
+        if self.splat {
+            DepositMode::Splat
+        } else {
+            DepositMode::Analytic
+        }
+    }
+
+    /// Re-run deposition after the debug path is toggled, and re-derive the
+    /// debug exposure from the new peak.
+    fn redeposit(&mut self) {
+        let mode = self.mode();
+        let Some(rendered) = &mut self.rendered else {
+            return;
+        };
+        rendered
+            .deposit
+            .run(&self.device, &self.queue, &hardcoded_spans(), mode);
+        let peak = rendered
+            .deposit
+            .read_back(&self.device, &self.queue)
+            .iter()
+            .map(|texel| texel[0].max(texel[1]).max(texel[2]))
+            .fold(0.0f32, f32::max);
+        rendered.exposure = if peak > 0.0 { 1.0 / peak } else { 1.0 };
+    }
+
     /// Letterbox the tube face into the window without distorting it.
     fn present_uniform(&self, rendered: &Rendered) -> PresentUniform {
         let tube = rendered.deposit.width() as f32 / rendered.deposit.height() as f32;
@@ -452,9 +487,14 @@ impl Gpu {
         }
 
         let raw_input = self.egui_state.take_egui_input(&self.window);
+        let mut splat = self.splat;
         let output = self.egui_ctx.clone().run_ui(raw_input, |ui| {
-            self.panel(ui, shaders);
+            self.panel(ui, shaders, &mut splat);
         });
+        if splat != self.splat {
+            self.splat = splat;
+            self.redeposit();
+        }
         self.egui_state
             .handle_platform_output(&self.window, output.platform_output);
         let paint_jobs = self
@@ -521,7 +561,7 @@ impl Gpu {
         }
     }
 
-    fn panel(&self, ui: &mut egui::Ui, shaders: &ShaderLibrary) {
+    fn panel(&self, ui: &mut egui::Ui, shaders: &ShaderLibrary, splat: &mut bool) {
         egui::Panel::left("shell").show(ui, |ui| {
             ui.heading("Trexy");
             ui.label(format!(
@@ -542,6 +582,17 @@ impl Gpu {
                 None => {
                     ui.label("no valid shader set");
                 }
+            }
+            ui.separator();
+
+            // The splat path is the documented counter-example, never a
+            // production route (CONTENTS.md, FIRST-SLICE.md §4).
+            ui.checkbox(splat, "debug: point splat");
+            if *splat {
+                ui.colored_label(
+                    egui::Color32::from_rgb(255, 190, 80),
+                    "forbidden path — beading reference only",
+                );
             }
             ui.separator();
 
