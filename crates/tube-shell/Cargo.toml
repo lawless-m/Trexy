@@ -12,6 +12,7 @@ tube-renderer.workspace = true
 beam-sources.workspace = true
 beam-rasteriser.workspace = true
 
+bytemuck.workspace = true
 wgpu.workspace = true
 winit.workspace = true
 egui.workspace = true

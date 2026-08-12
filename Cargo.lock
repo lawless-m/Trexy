@@ -2607,6 +2607,7 @@ dependencies = [
  "beam-rasteriser",
  "beam-sources",
  "beam-trace",
+ "bytemuck",
  "egui",
  "egui-wgpu",
  "egui-winit",

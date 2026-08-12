@@ -8,6 +8,24 @@ pub fn instance() -> wgpu::Instance {
     wgpu::Instance::new(descriptor)
 }
 
+/// A device with no window and no surface, for headless rendering.
+pub fn headless_device() -> Result<(wgpu::Device, wgpu::Queue), String> {
+    let instance = instance();
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        compatible_surface: None,
+        force_fallback_adapter: false,
+        ..Default::default()
+    }))
+    .map_err(|e| format!("no adapter: {e}"))?;
+
+    pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("headless"),
+        ..Default::default()
+    }))
+    .map_err(|e| format!("no device: {e}"))
+}
+
 /// Request an adapter and a device with no window and no surface, and report
 /// what turned up.
 ///

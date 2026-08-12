@@ -1,20 +1,43 @@
-//! The winit application: window, wgpu surface, egui side panel, and the
-//! file-watcher half of WGSL hot-reload.
+//! The winit application: window, wgpu surface, egui side panel, the
+//! file-watcher half of WGSL hot-reload, and the debug view of the deposit
+//! buffer.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, channel};
 
+use bytemuck::{Pod, Zeroable};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use tube_renderer::{Deposit, DepositParams, TubeProfile};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId};
 
 use crate::gpu;
+use crate::headless::{DISPLAY_HEIGHT, hardcoded_spans};
 use crate::shaders::{ShaderLibrary, shader_dir};
 
-const BACKGROUND_SHADER: &str = "background.wgsl";
+const DEPOSIT_SHADER: &str = "deposit.wgsl";
+const RESOLVE_SHADER: &str = "deposit_resolve.wgsl";
+const PRESENT_SHADER: &str = "present.wgsl";
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct PresentUniform {
+    fit: [f32; 2],
+    exposure: f32,
+    _pad: f32,
+}
+
+/// Everything rebuilt when a shader changes. Held as a unit so a failed
+/// rebuild leaves the previous one running untouched.
+struct Rendered {
+    deposit: Deposit,
+    pipeline: wgpu::RenderPipeline,
+    bind_group: wgpu::BindGroup,
+    exposure: f32,
+}
 
 struct Gpu {
     window: Arc<Window>,
@@ -23,9 +46,14 @@ struct Gpu {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     adapter_info: wgpu::AdapterInfo,
-    /// `None` until a shader validates; kept across a bad edit.
-    pipeline: Option<wgpu::RenderPipeline>,
-    pipeline_generation: Option<u64>,
+
+    sampler: wgpu::Sampler,
+    present_buffer: wgpu::Buffer,
+    present_layout: wgpu::BindGroupLayout,
+    /// `None` until a shader set validates; kept across a bad edit.
+    rendered: Option<Rendered>,
+    rendered_generation: Option<u64>,
+
     egui_ctx: egui::Context,
     egui_state: egui_winit::State,
     egui_renderer: egui_wgpu::Renderer,
@@ -107,7 +135,7 @@ impl ApplicationHandler for App {
         }
         match Gpu::new(event_loop) {
             Ok(mut gpu) => {
-                gpu.rebuild_pipeline(&self.shaders);
+                gpu.rebuild(&self.shaders);
                 self.gpu = Some(gpu);
             }
             Err(e) => {
@@ -140,7 +168,7 @@ impl ApplicationHandler for App {
         let changed = self.poll_shader_changes();
         if let Some(gpu) = &mut self.gpu {
             if changed {
-                gpu.rebuild_pipeline(&self.shaders);
+                gpu.rebuild(&self.shaders);
             }
             gpu.window.request_redraw();
         }
@@ -182,12 +210,56 @@ impl Gpu {
         let config = wgpu::SurfaceConfiguration {
             width: size.width.max(1),
             height: size.height.max(1),
+            format,
             ..surface
                 .get_default_config(&adapter, size.width.max(1), size.height.max(1))
                 .ok_or("surface is not supported by this adapter")?
         };
-        let config = wgpu::SurfaceConfiguration { format, ..config };
         surface.configure(&device, &config);
+
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("present"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let present_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("present"),
+            size: size_of::<PresentUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let present_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("present"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
 
         let egui_ctx = egui::Context::default();
         let egui_state = egui_winit::State::new(
@@ -208,8 +280,11 @@ impl Gpu {
             queue,
             config,
             adapter_info,
-            pipeline: None,
-            pipeline_generation: None,
+            sampler,
+            present_buffer,
+            present_layout,
+            rendered: None,
+            rendered_generation: None,
             egui_ctx,
             egui_state,
             egui_renderer,
@@ -225,31 +300,54 @@ impl Gpu {
         self.surface.configure(&self.device, &self.config);
     }
 
-    /// Build a pipeline from the library's installed source. If the library
-    /// has nothing valid, the existing pipeline is left alone — that is what
+    /// Rebuild the deposition pass and the present pipeline from the library's
+    /// installed sources, then deposit the debug spans once. If the library has
+    /// nothing valid, whatever is already running is left alone — that is what
     /// "keep the last good pipeline" means in practice.
-    fn rebuild_pipeline(&mut self, shaders: &ShaderLibrary) {
-        if self.pipeline_generation == Some(shaders.generation()) {
+    fn rebuild(&mut self, shaders: &ShaderLibrary) {
+        if self.rendered_generation == Some(shaders.generation()) {
             return;
         }
-        let Some(source) = shaders.get(BACKGROUND_SHADER) else {
+        let (Some(deposit_source), Some(resolve_source), Some(present_source)) = (
+            shaders.get(DEPOSIT_SHADER),
+            shaders.get(RESOLVE_SHADER),
+            shaders.get(PRESENT_SHADER),
+        ) else {
             return;
         };
 
-        // Already naga-validated on the CPU, so this compile is not expected
-        // to fail; if the backend disagrees, keep the last good pipeline.
+        // Already naga-validated on the CPU, so these compiles are not expected
+        // to fail; if the backend disagrees, keep what is running.
         let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+
+        let mut deposit = Deposit::new(
+            &self.device,
+            DISPLAY_HEIGHT,
+            TubeProfile::default(),
+            DepositParams::default(),
+            deposit_source,
+            resolve_source,
+        );
+        deposit.run(&self.device, &self.queue, &hardcoded_spans());
+
         let module = self
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some(BACKGROUND_SHADER),
-                source: wgpu::ShaderSource::Wgsl(source.into()),
+                label: Some(PRESENT_SHADER),
+                source: wgpu::ShaderSource::Wgsl(present_source.into()),
+            });
+        let layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("present"),
+                bind_group_layouts: &[Some(&self.present_layout)],
+                immediate_size: 0,
             });
         let pipeline = self
             .device
             .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("background"),
-                layout: None,
+                label: Some("present"),
+                layout: Some(&layout),
                 vertex: wgpu::VertexState {
                     module: &module,
                     entry_point: Some("vs_main"),
@@ -268,13 +366,61 @@ impl Gpu {
                 multiview_mask: None,
                 cache: None,
             });
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("present"),
+            layout: &self.present_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(deposit.scratch_view()),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.present_buffer.as_entire_binding(),
+                },
+            ],
+        });
 
         if let Some(error) = pollster::block_on(scope.pop()) {
-            eprintln!("{BACKGROUND_SHADER}: device rejected a validated shader: {error}");
+            eprintln!("device rejected a validated shader set: {error}");
             return;
         }
-        self.pipeline = Some(pipeline);
-        self.pipeline_generation = Some(shaders.generation());
+
+        // One readback to set the debug exposure. Deposited energies are tiny
+        // in absolute terms; the real chain tonemaps instead (RENDERER.md §3.3).
+        let peak = deposit
+            .read_back(&self.device, &self.queue)
+            .iter()
+            .map(|texel| texel[0].max(texel[1]).max(texel[2]))
+            .fold(0.0f32, f32::max);
+
+        self.rendered = Some(Rendered {
+            deposit,
+            pipeline,
+            bind_group,
+            exposure: if peak > 0.0 { 1.0 / peak } else { 1.0 },
+        });
+        self.rendered_generation = Some(shaders.generation());
+    }
+
+    /// Letterbox the tube face into the window without distorting it.
+    fn present_uniform(&self, rendered: &Rendered) -> PresentUniform {
+        let tube = rendered.deposit.width() as f32 / rendered.deposit.height() as f32;
+        let window = self.config.width as f32 / self.config.height as f32;
+        let fit = if window > tube {
+            [tube / window, 1.0]
+        } else {
+            [1.0, window / tube]
+        };
+        PresentUniform {
+            fit,
+            exposure: rendered.exposure,
+            _pad: 0.0,
+        }
     }
 
     fn redraw(&mut self, shaders: &ShaderLibrary) {
@@ -298,6 +444,12 @@ impl Gpu {
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
+
+        if let Some(rendered) = &self.rendered {
+            let uniform = self.present_uniform(rendered);
+            self.queue
+                .write_buffer(&self.present_buffer, 0, bytemuck::bytes_of(&uniform));
+        }
 
         let raw_input = self.egui_state.take_egui_input(&self.window);
         let output = self.egui_ctx.clone().run_ui(raw_input, |ui| {
@@ -352,8 +504,9 @@ impl Gpu {
                 })
                 .forget_lifetime();
 
-            if let Some(pipeline) = &self.pipeline {
-                pass.set_pipeline(pipeline);
+            if let Some(rendered) = &self.rendered {
+                pass.set_pipeline(&rendered.pipeline);
+                pass.set_bind_group(0, &rendered.bind_group, &[]);
                 pass.draw(0..3, 0..1);
             }
             self.egui_renderer.render(&mut pass, &paint_jobs, &screen);
@@ -375,6 +528,21 @@ impl Gpu {
                 "{} ({:?})",
                 self.adapter_info.name, self.adapter_info.backend
             ));
+            ui.separator();
+
+            match &self.rendered {
+                Some(rendered) => {
+                    ui.label(format!(
+                        "deposit {}×{}",
+                        rendered.deposit.width(),
+                        rendered.deposit.height()
+                    ));
+                    ui.label(format!("debug exposure ×{:.0}", rendered.exposure));
+                }
+                None => {
+                    ui.label("no valid shader set");
+                }
+            }
             ui.separator();
 
             ui.label(format!("shaders: generation {}", shaders.generation()));

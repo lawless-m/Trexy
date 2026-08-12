@@ -198,10 +198,20 @@ mod tests {
     }
 
     #[test]
-    fn the_shipped_background_shader_validates() {
-        let path = shader_dir().join("background.wgsl");
-        let source =
-            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-        validate_wgsl(&source).unwrap();
+    fn every_shipped_shader_validates() {
+        let dir = shader_dir();
+        let mut library = ShaderLibrary::new();
+        library.reload_dir(&dir);
+        assert!(
+            library.error().is_none(),
+            "{}: {}",
+            dir.display(),
+            library.error().unwrap_or_default()
+        );
+        assert!(
+            library.generation() > 0,
+            "{} contained no .wgsl files",
+            dir.display()
+        );
     }
 }
