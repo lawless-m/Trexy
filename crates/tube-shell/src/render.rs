@@ -27,7 +27,23 @@ pub struct RenderOptions {
     pub params: TubeParams,
 }
 
-pub fn render(options: &RenderOptions) -> Result<(), String> {
+/// A finished render, before it becomes a file.
+pub struct Rendered {
+    pub width: u32,
+    pub height: u32,
+    /// Display values in 0..1, one entry per pixel.
+    pub image: Vec<[f32; 4]>,
+    pub timings: tube_renderer::Timings,
+    pub substeps: usize,
+    pub frames: u64,
+    pub samples: usize,
+    pub producer_id: String,
+    pub duration: f64,
+}
+
+/// Render a trace and hand back the image, so the regression suite can compare
+/// exactly what the CLI would have written.
+pub fn render_to_image(options: &RenderOptions) -> Result<Rendered, String> {
     let trace = beam_trace::read_file(&options.trace)
         .map_err(|e| format!("{}: {e}", options.trace.display()))?;
 
@@ -84,28 +100,51 @@ pub fn render(options: &RenderOptions) -> Result<(), String> {
     }
     let timings = field.render(&device, &queue, options.view, &trace.samples);
 
-    let image = field.readout().read_back(&device, &queue);
-    let width = field.output_width();
-    let height = field.output_height();
-    let lit = image.iter().filter(|p| p[0] + p[1] + p[2] > 0.0).count();
+    Ok(Rendered {
+        width: field.output_width(),
+        height: field.output_height(),
+        image: field.readout().read_back(&device, &queue),
+        timings,
+        substeps,
+        frames,
+        samples: trace.samples.len(),
+        producer_id: trace.header.producer_id,
+        duration,
+    })
+}
 
-    write_png(&options.out, width, height, &image)?;
+pub fn render(options: &RenderOptions) -> Result<(), String> {
+    let rendered = render_to_image(options)?;
+    let lit = rendered
+        .image
+        .iter()
+        .filter(|p| p[0] + p[1] + p[2] > 0.0)
+        .count();
+
+    write_png(
+        &options.out,
+        rendered.width,
+        rendered.height,
+        &rendered.image,
+    )?;
 
     println!(
         "{} ({} samples, producer {:?})",
         options.trace.display(),
-        trace.samples.len(),
-        trace.header.producer_id
+        rendered.samples,
+        rendered.producer_id
     );
     println!(
-        "{duration:.3} s at {} Hz: {frames} frames, {substeps} substeps",
-        options.frame_hz
+        "{:.3} s at {} Hz: {} frames, {} substeps",
+        rendered.duration, options.frame_hz, rendered.frames, rendered.substeps
     );
     println!(
-        "{width}x{height}, view {}: {lit} non-black pixels",
+        "{}x{}, view {}: {lit} non-black pixels",
+        rendered.width,
+        rendered.height,
         options.view.name()
     );
-    print_timings(&timings);
+    print_timings(&rendered.timings);
     println!("wrote {}", options.out.display());
 
     if lit == 0 {
@@ -195,7 +234,7 @@ pub fn write_png(path: &Path, width: u32, height: u32, image: &[[f32; 4]]) -> Re
 
 /// The tonemap emits linear display values; PNG is sRGB, so the encode happens
 /// here. On screen the sRGB surface format does the same job.
-fn srgb_encode(linear: f32) -> f32 {
+pub fn srgb_encode(linear: f32) -> f32 {
     if linear <= 0.003_130_8 {
         12.92 * linear
     } else {

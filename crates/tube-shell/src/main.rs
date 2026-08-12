@@ -1,18 +1,12 @@
 //! The native shell: window, UI, source selection, record/replay.
 
-mod app;
-mod gpu;
-mod headless;
-mod render;
-mod shaders;
-mod source;
-
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use headless::DebugOptions;
-use render::{DEFAULT_FRAME_HZ, RenderOptions};
 use tube_renderer::View;
+use tube_shell::headless::{self, DebugOptions};
+use tube_shell::render::{self, DEFAULT_FRAME_HZ, RenderOptions};
+use tube_shell::{app, gpu, regression};
 
 const USAGE: &str = "\
 tube-shell — vector tube renderer
@@ -23,6 +17,7 @@ tube-shell — vector tube renderer
     tube-shell --headless-debug --out FILE [options]
     tube-shell --write-smoke-trace FILE     write a small .btr0 for smoke tests
     tube-shell --write-profiles DIR         write the shipped tube profiles
+    tube-shell --bless                      re-render every blessed regression image
 
   --headless options
     --sim-seconds S  how much of the trace to replay (default: all of it)
@@ -50,6 +45,7 @@ fn main() -> ExitCode {
             Some(path) => write_smoke_trace(Path::new(path)),
             None => Err(format!("--write-smoke-trace needs a path\n\n{USAGE}")),
         },
+        Some("--bless") => bless(),
         Some("--write-profiles") => match args.get(1) {
             Some(path) => write_profiles(Path::new(path)),
             None => Err(format!("--write-profiles needs a directory\n\n{USAGE}")),
@@ -83,6 +79,22 @@ fn write_smoke_trace(path: &Path) -> Result<(), String> {
     beam_trace::write_file(path, &trace.header, &trace.samples)
         .map_err(|e| format!("{}: {e}", path.display()))?;
     println!("wrote {} ({} samples)", path.display(), trace.samples.len());
+    Ok(())
+}
+
+/// Re-render every regression image from the fixtures.
+///
+/// A renderer change that alters these is not a failure by itself — but it
+/// must be an intended change, blessed deliberately and in the same commit as
+/// whatever caused it (FIRST-SLICE.md §5).
+fn bless() -> Result<(), String> {
+    let params = regression::blessed_params()?;
+    for case in regression::CASES {
+        let out = case.blessed_path();
+        render::render(&case.options(out.clone(), params))?;
+        println!("  pattern {} — {}", case.number, case.note);
+    }
+    println!("blessed {} images", regression::CASES.len());
     Ok(())
 }
 
