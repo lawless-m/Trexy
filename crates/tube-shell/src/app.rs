@@ -81,6 +81,8 @@ struct Gpu {
     timings: Timings,
     /// Samples pulled from the ring for the last frame, for the panel.
     window_samples: usize,
+    /// Simulated time the last frame threw away rather than catching up on.
+    skipped_seconds: f64,
     params: TubeParams,
     /// What the current buffers were built with, so a structural change is
     /// noticed and rebuilt rather than silently ignored.
@@ -332,6 +334,7 @@ impl Gpu {
             view: View::default(),
             timings: Timings::default(),
             window_samples: 0,
+            skipped_seconds: 0.0,
             params: TubeParams::default(),
             built_with: TubeParams::default(),
             profile_status: String::new(),
@@ -579,6 +582,7 @@ impl Gpu {
                 .field
                 .render(&self.device, &self.queue, selected, &window);
             self.window_samples = window.len();
+            self.skipped_seconds = rendered.field.skipped_seconds();
         }
 
         let raw_input = self.egui_state.take_egui_input(&self.window);
@@ -774,6 +778,14 @@ impl Gpu {
             self.timings.field_advance_micros / 1000.0,
             self.timings.substeps
         ));
+        if self.skipped_seconds > 0.0 {
+            // Falling behind is a real condition, not a detail to hide: the
+            // picture is missing whatever happened in the skipped time.
+            ui.colored_label(
+                egui::Color32::from_rgb(255, 190, 80),
+                format!("behind: skipped {:.0} ms", self.skipped_seconds * 1000.0),
+            );
+        }
         if !self.timings.gpu_supported {
             ui.label("no timestamp queries on this adapter");
             return;

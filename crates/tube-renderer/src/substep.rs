@@ -52,6 +52,17 @@ impl SubstepClock {
         self.origin + self.steps as f64 * self.dt
     }
 
+    /// Jump forward to `target` without simulating, staying on the grid.
+    ///
+    /// Used when the renderer has fallen so far behind that catching up
+    /// honestly is not possible; see [`crate::frame::MAX_CATCHUP_SECONDS`].
+    /// Boundaries remain at `origin + k·dt`, so the grid is intact and the
+    /// host-independence property is untouched — time is dropped, not bent.
+    pub fn skip_to(&mut self, target: f64) {
+        let steps = ((target - self.origin) / self.dt).floor().max(0.0) as u64;
+        self.steps = self.steps.max(steps);
+    }
+
     /// Every whole substep that completes at or before `now`.
     pub fn advance(&mut self, now: f64) -> Vec<Substep> {
         let mut out = Vec::new();
@@ -178,6 +189,33 @@ mod tests {
                 "substep was {length} s"
             );
         }
+    }
+
+    #[test]
+    fn skipping_stays_on_the_grid() {
+        let mut clock = SubstepClock::new(0.0);
+        clock.advance(SUBSTEP_SECONDS * 10.0);
+        clock.skip_to(5.0);
+
+        // Landed on a grid boundary, not 5.0 exactly.
+        let landed = clock.simulated();
+        let grid = (landed / SUBSTEP_SECONDS).round() * SUBSTEP_SECONDS;
+        assert!((landed - grid).abs() < 1e-9, "{landed} is off the grid");
+        assert!(landed <= 5.0 && landed > 5.0 - SUBSTEP_SECONDS);
+
+        // And the substeps that follow are still exactly dt apart.
+        let after = clock.advance(landed + SUBSTEP_SECONDS * 3.5);
+        assert_eq!(after.len(), 3);
+        assert_eq!(after[0].start, landed as f32);
+    }
+
+    #[test]
+    fn skipping_never_moves_time_backwards() {
+        let mut clock = SubstepClock::new(0.0);
+        clock.advance(1.0);
+        let before = clock.simulated();
+        clock.skip_to(0.5);
+        assert_eq!(clock.simulated(), before);
     }
 
     #[test]

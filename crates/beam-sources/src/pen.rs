@@ -216,18 +216,30 @@ impl Pen {
         let (p0, d0) = path(u0);
         let (p1, d1) = path(u1);
         let um = 0.5 * (u0 + u1);
-        let (pm, dm) = path(um);
 
-        // Error of the chord against the true path, measured at the midpoint.
-        let chord = [0.5 * (p0[0] + p1[0]), 0.5 * (p0[1] + p1[1])];
-        let deviation = ((pm[0] - chord[0]).powi(2) + (pm[1] - chord[1]).powi(2)).sqrt();
-        let drive_error = (0..3)
-            .map(|c| (dm[c] - 0.5 * (d0[c] + d1[c])).abs())
-            .fold(0.0f32, f32::max);
+        // Error of the chord against the true path, at several interior points
+        // rather than only the middle. One sample point can sit exactly on the
+        // chord by symmetry; three at different fractions cannot all do so for
+        // any path this generator produces.
+        let mut deviation = 0.0f32;
+        let mut drive_error = 0.0f32;
+        for fraction in [0.25, 0.5, 0.75] {
+            let (at, drive) = path(u0 + (u1 - u0) * fraction);
+            let chord = [
+                p0[0] + (p1[0] - p0[0]) * fraction,
+                p0[1] + (p1[1] - p0[1]) * fraction,
+            ];
+            deviation =
+                deviation.max(((at[0] - chord[0]).powi(2) + (at[1] - chord[1]).powi(2)).sqrt());
+            for c in 0..3 {
+                drive_error =
+                    drive_error.max((drive[c] - (d0[c] + (d1[c] - d0[c]) * fraction)).abs());
+            }
+        }
 
         let divisible = (u1 - u0) * seconds > 2.0 * MIN_SPAN_SECONDS;
-        if depth < MAX_DEPTH
-            && divisible
+        if divisible
+            && depth < MAX_DEPTH
             && (deviation > self.epsilon || drive_error > DRIVE_TOLERANCE)
         {
             self.refine(path, u0, um, start, seconds, depth + 1);
@@ -315,6 +327,53 @@ mod tests {
             worst <= EPSILON,
             "worst deviation was {worst}, ε is {EPSILON}"
         );
+    }
+
+    /// The bug this guards against emitted two samples for a whole figure and
+    /// drew a straight line across the tube.
+    #[test]
+    fn a_symmetric_figure_is_not_fooled_by_its_own_symmetry() {
+        // A closed 3:2 Lissajous: every early chord's midpoint sits exactly on
+        // the true path, so a midpoint-only estimator reads zero error.
+        let period = 0.2f32;
+        let path = |u: f32| {
+            let w = std::f32::consts::TAU * 5.0 * (u * period);
+            (
+                [
+                    0.8 * (3.0 * w + std::f32::consts::FRAC_PI_2).sin(),
+                    0.8 * (2.0 * w).sin(),
+                ],
+                [1.0; 3],
+            )
+        };
+
+        let mut pen = Pen::new(path(0.0).0, EPSILON);
+        let start = pen.curve(period, path);
+        let samples: Vec<_> = pen
+            .samples()
+            .iter()
+            .filter(|s| s.t >= start)
+            .copied()
+            .collect();
+
+        assert!(
+            samples.len() > 200,
+            "the figure took only {} samples; a straight line is not a Lissajous",
+            samples.len()
+        );
+
+        let mut worst = 0.0f32;
+        for pair in samples.windows(2) {
+            for step in 0..=8 {
+                let f = step as f32 / 8.0;
+                let t = pair[0].t + (pair[1].t - pair[0].t) * f;
+                let (truth, _) = path((t - start) / period);
+                let x = pair[0].x + (pair[1].x - pair[0].x) * f;
+                let y = pair[0].y + (pair[1].y - pair[0].y) * f;
+                worst = worst.max(((truth[0] - x).powi(2) + (truth[1] - y).powi(2)).sqrt());
+            }
+        }
+        assert!(worst <= EPSILON, "worst deviation {worst}, ε is {EPSILON}");
     }
 
     #[test]

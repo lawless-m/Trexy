@@ -590,6 +590,37 @@ mod tests {
     }
 
     #[test]
+    fn the_renderer_query_pattern_keeps_finding_samples() {
+        let source = LiveSource::spawn();
+        std::thread::sleep(Duration::from_millis(300));
+
+        // Exactly what the shell does each frame: ask from where the field got
+        // to, up to the present.
+        let mut simulated = 0.0f64;
+        for round in 0..8 {
+            std::thread::sleep(Duration::from_millis(120));
+            let now = source.elapsed();
+            let window = source.window(simulated as f32, now as f32);
+            let span = window
+                .last()
+                .zip(window.first())
+                .map(|(b, a)| b.t - a.t)
+                .unwrap_or(0.0);
+            println!(
+                "round {round}: buffered {:6}  now {now:7.3}  simulated {simulated:7.3}  \
+                 window {:5} samples spanning {span:.4} s",
+                source.buffered(),
+                window.len()
+            );
+            assert!(
+                !window.is_empty(),
+                "round {round}: the window came back empty"
+            );
+            simulated = now;
+        }
+    }
+
+    #[test]
     fn the_producer_fills_the_ring_with_a_valid_trace() {
         let source = LiveSource::spawn();
         std::thread::sleep(SETTLE);

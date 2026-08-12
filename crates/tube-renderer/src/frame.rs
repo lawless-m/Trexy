@@ -8,6 +8,16 @@ use crate::readout::{Readout, ReadoutParams, ReadoutShaders, View};
 use crate::substep::{SubstepClock, clip_spans};
 use crate::timing::Timings;
 
+/// The most simulated time a single frame will catch up on.
+///
+/// Beyond this the clock jumps rather than simulating. The ring buffer holds
+/// 200 ms because anything older is fully decayed (TRACE-FORMAT.md §5), so
+/// there is nothing out there to draw anyway — and without a bound a slow
+/// frame becomes a death spiral: more backlog, more substeps, a slower frame,
+/// more backlog. A cold start is the common case, the shader compile and
+/// window creation having taken a second before the first frame ran.
+pub const MAX_CATCHUP_SECONDS: f64 = 0.1;
+
 /// Every parameter the tube model takes, grouped by the pass that owns it.
 /// The provenance classes live on the individual structs (ARCHITECTURE.md §4).
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -74,6 +84,7 @@ pub struct Field {
     /// per substep, so they are measured together rather than per pass.
     last_advance_micros: f32,
     last_substeps: usize,
+    last_skipped_seconds: f64,
 }
 
 impl Field {
@@ -130,6 +141,7 @@ impl Field {
             params,
             last_advance_micros: 0.0,
             last_substeps: 0,
+            last_skipped_seconds: 0.0,
         }
     }
 
@@ -195,6 +207,13 @@ impl Field {
         self.clock.simulated()
     }
 
+    /// Simulated time the last advance threw away rather than catching up on.
+    /// Non-zero means the renderer could not keep pace, and the panel says so
+    /// rather than letting it pass unnoticed.
+    pub fn skipped_seconds(&self) -> f64 {
+        self.last_skipped_seconds
+    }
+
     /// Advance the field to wall-clock `now`, in whole substeps.
     ///
     /// Each substep deposits only the trace that belongs to its own window and
@@ -213,6 +232,17 @@ impl Field {
         mode: DepositMode,
     ) -> usize {
         let started = std::time::Instant::now();
+
+        // Drop any backlog beyond what is worth simulating, before working out
+        // which substeps to run.
+        let behind = now - self.clock.simulated();
+        self.last_skipped_seconds = if behind > MAX_CATCHUP_SECONDS {
+            self.clock.skip_to(now - MAX_CATCHUP_SECONDS);
+            behind - MAX_CATCHUP_SECONDS
+        } else {
+            0.0
+        };
+
         let substeps = self.clock.advance(now);
         let dt = self.clock.dt();
 
