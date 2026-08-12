@@ -4,7 +4,18 @@ use beam_trace::Sample;
 
 use crate::deposit::{Deposit, DepositMode, DepositParams, DepositShaders, TubeProfile};
 use crate::phosphor::{Component, Phosphor, PhosphorParams};
+use crate::readout::{Readout, ReadoutParams, ReadoutShaders};
 use crate::substep::{SubstepClock, clip_spans};
+
+/// Every parameter the tube model takes, grouped by the pass that owns it.
+/// The provenance classes live on the individual structs (ARCHITECTURE.md §4).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TubeParams {
+    pub profile: TubeProfile,
+    pub deposit: DepositParams,
+    pub phosphor: PhosphorParams,
+    pub readout: ReadoutParams,
+}
 
 /// Every WGSL source the field needs.
 pub struct FieldShaders<'a> {
@@ -12,13 +23,19 @@ pub struct FieldShaders<'a> {
     pub splat: &'a str,
     pub resolve: &'a str,
     pub phosphor: &'a str,
+    pub readout: &'a str,
+    pub blur: &'a str,
+    pub tonemap: &'a str,
 }
 
 /// Deposition plus the phosphor field it feeds, driven on the fixed substep
 /// grid.
+/// The whole layer-3 chain: deposition, the phosphor field it feeds, and the
+/// readout that turns that field into a picture.
 pub struct Field {
     deposit: Deposit,
     phosphor: Phosphor,
+    readout: Readout,
     clock: SubstepClock,
 }
 
@@ -26,17 +43,15 @@ impl Field {
     pub fn new(
         device: &wgpu::Device,
         display_height: u32,
-        profile: TubeProfile,
-        deposit_params: DepositParams,
-        phosphor_params: PhosphorParams,
+        params: TubeParams,
         shaders: FieldShaders<'_>,
         epoch: f64,
     ) -> Self {
         let deposit = Deposit::new(
             device,
             display_height,
-            profile,
-            deposit_params,
+            params.profile,
+            params.deposit,
             DepositShaders {
                 deposit: shaders.deposit,
                 splat: shaders.splat,
@@ -47,15 +62,47 @@ impl Field {
             device,
             deposit.width(),
             deposit.height(),
-            phosphor_params,
+            params.phosphor,
             deposit.scratch_view(),
             shaders.phosphor,
+        );
+        let readout = Readout::new(
+            device,
+            deposit.width(),
+            deposit.height(),
+            crate::SUPERSAMPLE,
+            params.readout,
+            &phosphor,
+            ReadoutShaders {
+                readout: shaders.readout,
+                blur: shaders.blur,
+                tonemap: shaders.tonemap,
+            },
         );
         Self {
             deposit,
             phosphor,
+            readout,
             clock: SubstepClock::new(epoch),
         }
+    }
+
+    /// Run the readout chain and return the final tonemapped image's view.
+    pub fn render(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> &wgpu::TextureView {
+        self.readout.render(device, queue, &self.phosphor);
+        self.readout.output_view()
+    }
+
+    pub fn readout(&self) -> &Readout {
+        &self.readout
+    }
+
+    pub fn output_width(&self) -> u32 {
+        self.readout.output_width()
+    }
+
+    pub fn output_height(&self) -> u32 {
+        self.readout.output_height()
     }
 
     pub fn width(&self) -> u32 {

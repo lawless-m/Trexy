@@ -210,9 +210,19 @@ impl Phosphor {
 
     /// The live buffer for a component — what the readout pass samples.
     pub fn texture(&self, component: Component) -> &wgpu::Texture {
+        self.phase_texture(component, self.current)
+    }
+
+    /// Which half of the ping-pong currently holds the live state. The readout
+    /// keeps one bind group per phase rather than rebuilding every frame.
+    pub fn phase(&self) -> usize {
+        self.current
+    }
+
+    pub fn phase_texture(&self, component: Component, phase: usize) -> &wgpu::Texture {
         match component {
-            Component::Fast => &self.fast[self.current],
-            Component::Slow => &self.slow[self.current],
+            Component::Fast => &self.fast[phase],
+            Component::Slow => &self.slow[phase],
         }
     }
 

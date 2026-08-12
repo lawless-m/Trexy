@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use beam_trace::{Sample, flags};
 use tube_renderer::{
     Component, Deposit, DepositMode, DepositParams, DepositShaders, Field, FieldShaders,
-    PhosphorParams, TubeProfile,
+    TubeParams, TubeProfile,
 };
 
 use crate::gpu;
@@ -199,14 +199,15 @@ fn simulate_decay(
     let mut field = Field::new(
         device,
         DISPLAY_HEIGHT,
-        TubeProfile::default(),
-        DepositParams::default(),
-        PhosphorParams::default(),
+        TubeParams::default(),
         FieldShaders {
             deposit: source("deposit.wgsl")?,
             splat: source("deposit_splat.wgsl")?,
             resolve: source("deposit_resolve.wgsl")?,
             phosphor: source("phosphor.wgsl")?,
+            readout: source("readout.wgsl")?,
+            blur: source("blur.wgsl")?,
+            tonemap: source("tonemap.wgsl")?,
         },
         0.0,
     );
