@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+description = "The BTR0 beam trace: a 32-byte sample format describing where a vector-CRT beam went and how hard it was driven, with a ring buffer, file I/O and validation."
+readme = "README.md"
+keywords = ["vector", "crt", "oscilloscope", "beam", "trace"]
+categories = ["graphics", "encoding"]
 
 [dependencies]
 bytemuck.workspace = true
