@@ -30,13 +30,24 @@ pub const DISPLAY_HEIGHT: u32 = 512;
 /// what [`CASES`] pattern 6 checks — but something has to drive the loop.
 pub const FRAME_HZ: f64 = 60.0;
 
-/// Mean absolute per-channel error, as a fraction of full scale, that two
-/// renders of the same trace may differ by.
+/// The largest **per-subpixel** difference, as a fraction of full scale, that
+/// two renders of the same trace may differ by.
 ///
-/// Non-zero because GPU arithmetic is not bit-reproducible across drivers, and
-/// small because anything the renderer actually changes moves it far further
-/// than this.
-pub const TOLERANCE: f32 = 0.01;
+/// Per subpixel and not averaged over the frame, because a frame average is the
+/// wrong statistic for a vector display. The screen is ~99% black, so a defect
+/// — which is always localised, this renderer draws nothing that isn't — gets
+/// divided away by the pixels that agree. Measured: a plainly visible 8-pixel
+/// streak trailing every parked dot scored 0.000196 against the old frame-
+/// averaged 0.01 gate, fifty-one times under it, while a *wholly black screen*
+/// scored only 0.0201. An average could detect "rendered nothing at all" and
+/// almost nothing else, and it duly waved through 299 bad spans across all
+/// seven fixtures.
+///
+/// Non-zero because GPU arithmetic is not bit-reproducible across drivers. The
+/// cost of measuring the worst subpixel instead of the mean is that a genuine
+/// sub-texel resampling shift shows up as a large edge difference — which is a
+/// true report, but will need re-blessing rather than ignoring.
+pub const TOLERANCE: f32 = 0.02;
 
 /// One blessed case.
 pub struct Case {
@@ -128,8 +139,47 @@ pub fn blessed_params() -> Result<TubeParams, String> {
     )
 }
 
+/// The worst per-channel difference between two 8-bit RGB images, as a fraction
+/// of full scale, with the pixel it was found at.
+///
+/// This is the gate the blessed comparison uses — see [`TOLERANCE`] for why a
+/// frame average is not fit for the purpose. Returning the location as well
+/// keeps a failure diagnosable: "differs by 0.26 at (277, 255)" says where to
+/// look, which "mean error 0.0002" never did.
+pub fn worst_difference(a: &[u8], b: &[u8], width: u32) -> Result<(f32, u32, u32), String> {
+    if a.len() != b.len() {
+        return Err(format!(
+            "images are different sizes: {} and {} bytes",
+            a.len(),
+            b.len()
+        ));
+    }
+    if a.is_empty() {
+        return Err("the images are empty".to_owned());
+    }
+
+    let (index, worst) = a
+        .iter()
+        .zip(b)
+        .map(|(x, y)| x.abs_diff(*y))
+        .enumerate()
+        .max_by_key(|(_, delta)| *delta)
+        .expect("the images are not empty");
+
+    let pixel = index as u32 / 3;
+    Ok((
+        f32::from(worst) / 255.0,
+        pixel % width.max(1),
+        pixel / width.max(1),
+    ))
+}
+
 /// Mean absolute per-channel difference between two 8-bit images, as a
 /// fraction of full scale.
+///
+/// Only sound for asserting *exact* equality, which is all it is used for. As a
+/// tolerance gate it hides localised defects — [`TOLERANCE`] carries the
+/// numbers.
 pub fn difference(a: &[u8], b: &[u8]) -> Result<f32, String> {
     if a.len() != b.len() {
         return Err(format!(

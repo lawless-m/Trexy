@@ -115,13 +115,23 @@ impl Pen {
         let total = ((to[0] - from[0]).powi(2) + (to[1] - from[1]).powi(2)).sqrt();
 
         if drive != self.drive {
-            if total <= 0.0 {
-                // Nowhere to move; the change is genuinely stationary.
+            if total <= 0.0 || drive == [0.0; 3] {
+                // Nowhere to move, or the gun is cutting out: blanking belongs
+                // at the end of the lit path, so the drive falls while the beam
+                // is still at `from` and only then does it fly away dark.
+                //
+                // Riding the start of the sweep here instead — symmetrically
+                // with unblanking below — budgets the transition in time, and
+                // a microsecond at BLANK_SPEED is 0.04 of full deflection. That
+                // trails a visible streak off every dot and every stroke end,
+                // in the direction of the next move.
                 self.set_drive(drive);
             } else {
                 // Release blanking as the sweep starts, not before it. The
                 // transition rides the first microsecond of travel, so it
                 // deposits a short faint segment instead of a terminal dot.
+                // Unblanking happens at drawing speed, where that stays under
+                // the ε the trace is sampled to (TRACE-FORMAT.md §4).
                 let f = (DRIVE_STEP_SECONDS * speed / total).min(0.5);
                 let point = [
                     from[0] + (to[0] - from[0]) * f,

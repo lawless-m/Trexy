@@ -6,7 +6,7 @@
 
 use tube_shell::regression::{
     ANALYTIC, CASES, DISPLAY_HEIGHT, TOLERANCE, blessed_params, difference, field_energy,
-    headless_field, load_png, to_srgb8,
+    headless_field, load_png, to_srgb8, worst_difference,
 };
 use tube_shell::render::render_to_image;
 
@@ -52,10 +52,11 @@ fn every_pattern_still_renders_as_blessed() {
             continue;
         }
 
-        match difference(&actual, &expected) {
-            Ok(error) if error <= TOLERANCE => {}
-            Ok(error) => failures.push(format!(
-                "pattern {} ({}) differs by {error:.5}, tolerance {TOLERANCE} — {}",
+        match worst_difference(&actual, &expected, width) {
+            Ok((error, ..)) if error <= TOLERANCE => {}
+            Ok((error, x, y)) => failures.push(format!(
+                "pattern {} ({}) differs by {error:.5} at ({x}, {y}), tolerance \
+                 {TOLERANCE} — {}",
                 case.number, case.fixture, case.note
             )),
             Err(e) => failures.push(format!("pattern {}: {e}", case.number)),
