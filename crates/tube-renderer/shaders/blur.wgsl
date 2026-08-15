@@ -5,19 +5,22 @@
 // reduced resolution, which is what "a small mip/blur chain" means in practice
 // and what makes a σ of 0.06 affordable at all.
 //
-// Taps are evenly spaced and weighted by the Gaussian, with the spacing chosen
-// on the CPU so that RADIUS taps reach about 3σ — beyond which the kernel
-// contributes under half a percent.
+// Taps are spaced exactly one *source* texel apart and the count varies with σ.
+// The spacing is the part that must not move: a tap stride wider than a source
+// texel stops averaging the source and starts sampling it, and a comb of point
+// samples run separably — comb across, then comb down — lays a rectangular
+// lattice over the picture. That is what a fixed stride of 3σ/8 did here, at a
+// halo σ of 30.7 source texels: taps 11.5 texels apart, and a visible wire mesh
+// over the whole face.
 
 struct Blur {
-    // Per-tap offset in source UV, along this pass's axis.
+    // Per-tap offset in source UV, along this pass's axis: one source texel.
     step: vec2<f32>,
-    _pad: vec2<f32>,
+    // σ in source texels, so tap i weighs exp(−i²/2σ²).
+    sigma_texels: f32,
+    // Taps each side of centre. Bounded on the CPU.
+    taps: f32,
 }
-
-const RADIUS: i32 = 8;
-// RADIUS taps reach 3σ, so one tap is 3/8 of a σ.
-const INV_SIGMA_TAPS: f32 = 0.375;
 
 @group(0) @binding(0) var source: texture_2d<f32>;
 @group(0) @binding(1) var source_sampler: sampler;
@@ -45,8 +48,11 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     var total = vec3<f32>(0.0);
     var weight_total = 0.0;
 
-    for (var i = -RADIUS; i <= RADIUS; i++) {
-        let d = f32(i) * INV_SIGMA_TAPS;
+    let taps = i32(blur.taps);
+    let inv_sigma = 1.0 / max(blur.sigma_texels, 1e-6);
+
+    for (var i = -taps; i <= taps; i++) {
+        let d = f32(i) * inv_sigma;
         let weight = exp(-0.5 * d * d);
         let uv = in.uv + blur.step * f32(i);
         total += textureSample(source, source_sampler, uv).rgb * weight;

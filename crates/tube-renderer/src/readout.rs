@@ -22,10 +22,14 @@ use crate::timing::{PassTimer, READOUT_PASSES, Timings};
 /// 0.06 face units is affordable only because most of the work happens small.
 const HALO_DIVISOR: u32 = 4;
 
-/// Must match `RADIUS` in blur.wgsl.
-const BLUR_RADIUS: f32 = 8.0;
-/// Taps reach this many σ, matching `INV_SIGMA_TAPS` in blur.wgsl.
+/// Taps reach this many σ, beyond which a Gaussian is under half a percent.
 const BLUR_REACH_SIGMAS: f32 = 3.0;
+
+/// Ceiling on taps each side, so a slider at full travel cannot cost the frame.
+/// Reached only above σ ≈ 0.083 face units; past there the halo is truncated
+/// short of 3σ, which shows as a slightly tighter halo — the honest failure,
+/// unlike a comb, which invents structure that is not in the field.
+const MAX_BLUR_TAPS: f32 = 128.0;
 
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
@@ -153,7 +157,8 @@ struct GpuChroma {
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct GpuBlur {
     step: [f32; 2],
-    _pad: [f32; 2],
+    sigma_texels: f32,
+    taps: f32,
 }
 
 #[repr(C)]
@@ -195,10 +200,15 @@ struct BlurPass {
     view: wgpu::TextureView,
     bind_group: wgpu::BindGroup,
     uniform: wgpu::Buffer,
-    /// Which σ this axis uses, so the tap spacing follows a live slider
-    /// rather than being frozen at construction.
+    /// Which σ this axis uses, so the tap count follows a live slider rather
+    /// than being frozen at construction.
     halo: bool,
     horizontal: bool,
+    /// How much smaller this pass's *source* is than the deposit buffer. Taps
+    /// are one source texel apart, so this is what sets their stride — and the
+    /// halo's horizontal pass reads full resolution while writing quarter, so
+    /// it does not match its own target.
+    source_divisor: u32,
 }
 
 pub struct Readout {
@@ -371,6 +381,7 @@ impl Readout {
                 uniform: uniforms[0].clone(),
                 halo: false,
                 horizontal: true,
+                source_divisor: 1,
             },
             BlurPass {
                 view: view(&scatter),
@@ -378,6 +389,7 @@ impl Readout {
                 uniform: uniforms[1].clone(),
                 halo: false,
                 horizontal: false,
+                source_divisor: 1,
             },
             BlurPass {
                 view: view(&halo_h),
@@ -385,6 +397,7 @@ impl Readout {
                 uniform: uniforms[2].clone(),
                 halo: true,
                 horizontal: true,
+                source_divisor: 1,
             },
             BlurPass {
                 view: view(&halo),
@@ -392,6 +405,7 @@ impl Readout {
                 uniform: uniforms[3].clone(),
                 halo: true,
                 horizontal: false,
+                source_divisor: HALO_DIVISOR,
             },
         ];
 
@@ -574,19 +588,34 @@ impl Readout {
     }
 
     /// σ is in face units — one unit is half the tube height — so it becomes
-    /// texels with the y scale, and UV per axis from there.
-    fn blur_step(&self, blur: &BlurPass) -> [f32; 2] {
+    /// texels with the y scale, then source texels with this pass's divisor.
+    ///
+    /// Taps land one source texel apart and the count follows σ. Spacing is the
+    /// invariant worth protecting: a stride wider than a texel samples the
+    /// source instead of averaging it, and separably that draws a lattice.
+    fn blur_uniform(&self, blur: &BlurPass) -> GpuBlur {
         let sigma = if blur.halo {
             self.params.glow_halo_sigma
         } else {
             self.params.glow_tight_sigma
         };
-        let texels = sigma * self.height as f32 / 2.0;
-        let spacing = BLUR_REACH_SIGMAS / BLUR_RADIUS;
-        if blur.horizontal {
-            [texels / self.width as f32 * spacing, 0.0]
+        let divisor = blur.source_divisor.max(1) as f32;
+        let source_width = (self.width as f32 / divisor).max(1.0);
+        let source_height = (self.height as f32 / divisor).max(1.0);
+
+        let sigma_texels = (sigma * self.height as f32 / 2.0 / divisor).max(1e-6);
+        let taps = (BLUR_REACH_SIGMAS * sigma_texels).ceil().min(MAX_BLUR_TAPS);
+
+        let step = if blur.horizontal {
+            [1.0 / source_width, 0.0]
         } else {
-            [0.0, texels / self.height as f32 * spacing]
+            [0.0, 1.0 / source_height]
+        };
+
+        GpuBlur {
+            step,
+            sigma_texels,
+            taps,
         }
     }
 
@@ -742,10 +771,7 @@ impl Readout {
             queue.write_buffer(
                 &blur.uniform,
                 0,
-                bytemuck::bytes_of(&GpuBlur {
-                    step: self.blur_step(blur),
-                    _pad: [0.0, 0.0],
-                }),
+                bytemuck::bytes_of(&self.blur_uniform(blur)),
             );
         }
         queue.write_buffer(
