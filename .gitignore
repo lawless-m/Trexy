@@ -1,3 +1,8 @@
 /target
 /recordings
 /screenshots
+.devlog/
+
+# Copyrighted BIOS and cartridge images. ARCHITECTURE.md §5: the user
+# supplies these; they are never redistributed with the renderer.
+/Vectrax-ROMS/
