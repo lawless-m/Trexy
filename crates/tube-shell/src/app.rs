@@ -18,7 +18,6 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 use crate::gpu;
-use crate::render::DISPLAY_HEIGHT;
 use crate::shaders::{ShaderLibrary, shader_dir};
 use crate::source::{Controls, LiveSource, Source};
 
@@ -87,6 +86,12 @@ struct Gpu {
     /// What the current buffers were built with, so a structural change is
     /// noticed and rebuilt rather than silently ignored.
     built_with: TubeParams,
+    /// Display rows the field was built for. The window is the display here,
+    /// so this follows it — a field frozen at the headless height renders a
+    /// small picture and lets the swapchain magnify it, which reads as visible
+    /// pixel steps on a slow stroke and makes every judgement by eye a
+    /// judgement of the upscaler.
+    field_height: u32,
     profile_status: String,
 
     egui_ctx: egui::Context,
@@ -337,6 +342,8 @@ impl Gpu {
             skipped_seconds: 0.0,
             params: TubeParams::default(),
             built_with: TubeParams::default(),
+            // Zero forces the first rebuild to size the field to the window.
+            field_height: 0,
             profile_status: String::new(),
             egui_ctx,
             egui_state,
@@ -364,9 +371,45 @@ impl Gpu {
     /// Rebuild the whole chain from the library's installed sources and replay
     /// the debug spans once. If the library has nothing valid, whatever is
     /// already running is left alone — that is "keep the last good pipeline".
+    /// Display rows whose deposit accumulator still fits one storage-buffer
+    /// binding.
+    ///
+    /// The accumulator is one `vec4<f32>` per deposit texel in a single
+    /// binding, and a single binding is capped — 128 MiB on this adapter, which
+    /// a 2074-row window blows past at 206 MB. Exceeding it is not a slow
+    /// render, it is a device validation failure and no field at all, so the
+    /// window has to be clamped to what the hardware will bind.
+    fn max_field_height(&self) -> u32 {
+        /// Rows above which this does not hold 60 Hz on a 4060.
+        ///
+        /// The binding limit alone allows 1672, but there the readout costs
+        /// ~9 ms a frame and the loop reports itself behind: the halo blur
+        /// spaces taps by the source texel, so its tap count grows with
+        /// resolution — σ reaches ~100 texels and wants 300 taps, past the
+        /// 128 ceiling, making the halo slow *and* truncated at once. The
+        /// real fix is to downsample before blurring the halo rather than
+        /// blurring it at full resolution; until then this is a ceiling
+        /// chosen by measurement, and the panel's field line shows what you
+        /// actually got.
+        const PERFORMANCE_ROWS: u32 = 1024;
+
+        const BYTES_PER_TEXEL: u64 = 16;
+        let limit = self.device.limits().max_storage_buffer_binding_size;
+        let supersample = f64::from(self.params.supersample.max(1));
+        let aspect = f64::from(self.params.profile.aspect_w / self.params.profile.aspect_h);
+        let texels = (limit / BYTES_PER_TEXEL) as f64;
+        // texels = (h·supersample)² · aspect
+        let rows = (texels / aspect).sqrt() / supersample;
+        (rows as u32).clamp(1, PERFORMANCE_ROWS)
+    }
+
     fn rebuild(&mut self, shaders: &ShaderLibrary, live: &LiveSource) {
         let structural = self.params.needs_rebuild(&self.built_with);
-        if self.rendered_generation == Some(shaders.generation()) && !structural {
+        let height = self.config.height.max(1).min(self.max_field_height());
+        if self.rendered_generation == Some(shaders.generation())
+            && !structural
+            && self.field_height == height
+        {
             return;
         }
         let source = |name: &str| shaders.get(name);
@@ -396,7 +439,7 @@ impl Gpu {
         let mut field = Field::new(
             &self.device,
             &self.queue,
-            DISPLAY_HEIGHT,
+            height,
             self.params,
             FieldShaders {
                 deposit: source("deposit.wgsl").expect("checked"),
@@ -483,6 +526,7 @@ impl Gpu {
         });
         self.rendered_generation = Some(shaders.generation());
         self.built_with = self.params;
+        self.field_height = height;
     }
 
     /// Dump the live ring buffer to a timestamped `.btr0`.
@@ -536,6 +580,10 @@ impl Gpu {
     }
 
     fn redraw(&mut self, shaders: &ShaderLibrary, source: &LiveSource) {
+        // Cheap when nothing moved, and it is what picks up a window resize:
+        // the field is sized to the window, so a drag has to reach it.
+        self.rebuild(shaders, source);
+
         use wgpu::CurrentSurfaceTexture as Acquired;
         let frame = match self.surface.get_current_texture() {
             Acquired::Success(frame) => frame,
