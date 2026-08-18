@@ -96,8 +96,10 @@ time constant looks either smeary or flickery with no middle ground.
   slight pincushion, portrait.)
 - **Overlay** (optional, per game): scanned translucent overlay multiplied
   over the image, plus a subtle unlit-overlay ambient term.
-- **Glass**: vignette, faint specular/room reflection (artistic class,
-  default subtle, off switch).
+- **Glass**: vignette, faint specular/room reflection (artistic class, off
+  switch). The reflection defaults to **off**: it models the room rather than
+  the tube, and a black floor is worth more to a vector display than a sheen —
+  an 0.01 gain held stroke-to-floor contrast to 3.4:1 against 50:1 without it.
 - **Tonemap**: exposure then a filmic-ish curve; operator choice deferred —
   parameterised so it can be swapped. HDR output path (Wayland) is future
   work; design keeps everything linear until this pass precisely so HDR is a
@@ -126,7 +128,8 @@ Fitted defaults are starting guesses to be tuned against test patterns.
 | Pincushion coeff | — | 0.02 | fitted | Vectrex profile |
 | Tube aspect | — | 3:4 portrait | schematic | Vectrex profile |
 | Exposure | — | 1.0 | artistic | |
-| Vignette / reflection gains | — | subtle | artistic | |
+| Vignette gain | — | 0.25 | artistic | |
+| Reflection gain | — | 0.0 | artistic | off; the Vectrex screen sits in a hood |
 
 Phosphor note: the Vectrex tube (Samsung 9" B/W) phosphor type is not stated
 in the service manual; standard white TV phosphor (P4-family) is the working

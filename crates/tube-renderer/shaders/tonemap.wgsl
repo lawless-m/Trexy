@@ -112,10 +112,18 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     // (RENDERER.md §3.3).
     let scattered = textureSample(glow_tight, field_sampler, uv).rgb;
     let halo = textureSample(glow_wide, field_sampler, uv).rgb;
-    var light = scattered + params.halo_gain * halo;
+
+    // Exposure scales *emitted* light, before the glass adds any of its own.
+    // Applying it after instead multiplies the room reflection by the same
+    // factor, so driving the beam harder raises the black floor exactly as
+    // fast as the strokes and the contrast ratio never improves — measured
+    // 3.4:1 falling to 1.6:1 across the slider, which reads as a scope trace
+    // on grey rather than a vector display. A real tube's faceplate does not
+    // bounce more room light when the gun is driven harder.
+    var light = (scattered + params.halo_gain * halo) * params.exposure;
 
     light = apply_overlay(light);
     light = apply_glass(light, in.uv);
 
-    return vec4<f32>(tonemap(light * params.exposure), 1.0);
+    return vec4<f32>(tonemap(light), 1.0);
 }

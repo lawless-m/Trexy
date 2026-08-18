@@ -36,5 +36,5 @@ pincushion = 0.02
 rotation = 0.0
 overscan = 1.0
 vignette = 0.25
-reflection = 0.01
+reflection = 0.0
 exposure = 1.0

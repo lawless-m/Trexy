@@ -71,7 +71,14 @@ impl Default for ReadoutParams {
             rotation: 0.0,
             overscan: 1.0,
             vignette: 0.25,
-            reflection: 0.01,
+            // Off by default. Room light bouncing off the faceplate is a
+            // property of the room, not the tube, and this renders a tube. It
+            // also costs more than it looks: an 0.01 sheen put a floor of 11
+            // under a stroke that peaks at 37, holding contrast to 3.4:1 where
+            // zero gives 50:1 — and a vector display is nothing but bright
+            // lines on black. Still here, still a slider, for anyone who wants
+            // to photograph a tube in a lit room.
+            reflection: 0.0,
             exposure: 1.0,
         }
     }
