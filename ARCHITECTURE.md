@@ -158,7 +158,17 @@ at bit rate → dashes and crude raster strips, so intensity varies *along*
 strokes; this falls out of the polyline-with-current trace for free. Games
 bypass the BIOS freely — there is no valid interception point above the VIA.
 VIA/T1 timing accuracy is the whole ballgame for the eventual core; the CPU is
-comparatively forgiving (TomHarte single-step JSON tests exist for the 6809).
+comparatively forgiving, though not as cheaply as first written here: there is
+**no** 6809 corpus in the SingleStepTests org (65x02, 680x0, m68000, z80 and the
+Intel family, but not this one). A third-party set exists —
+`neetandev/m6809`, 1000 tests per opcode across 318 files in the same MOO
+format, generated against MAME. Two strings attached: it carries no licence, so
+it can be validated against locally but not vendored into a repo that ships MIT
+OR Apache-2.0; and being MAME-derived it proves agreement with an emulator
+rather than with hardware, unlike the hardware-generated 8088/8086 sets. It also
+constrains the core's shape — dead cycles are recorded as real reads (from
+`$FFFF` or the instruction stream), so the CPU must model bus traffic per
+machine cycle rather than only per instruction.
 BIOS is copyrighted: user supplies it.
 
 **Atari AVG (Chill65).** Genuine display-list processor: digital position/rate
