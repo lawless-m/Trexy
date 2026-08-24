@@ -16,10 +16,20 @@ use beam_trace::Sample;
 
 /// Per-machine analogue constants. The filter is shared; only these differ
 /// between a Vectrex and an Atari deflection chain (ARCHITECTURE.md §2).
+///
+/// Every field carries a provenance class per ARCHITECTURE.md §4 — that split
+/// between measured and guessed *is* the accuracy claim, so a number without a
+/// source says so rather than borrowing authority from its neighbours.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Constants {
     /// Deflection units per second at full-scale rate. Sets stroke length for
     /// a given RAMP duration.
+    ///
+    /// **schematic (unverified).** Set by the integrator RC and the yoke's
+    /// deflection sensitivity, both of which need the service manual. 1.0 is a
+    /// placeholder meaning "full-scale rate crosses full deflection in one
+    /// second", chosen so the model is dimensionally honest, not because it is
+    /// the Vectrex's figure.
     pub integrator_gain: f32,
     /// Op-amp slew limit on the rate signal, full-scale units per second.
     ///
@@ -27,28 +37,58 @@ pub struct Constants {
     /// large-signal behaviour of an amplifier running out of current, and it
     /// is what rounds a fast corner. Small-signal settling is the separate
     /// `settle_tau` below.
+    ///
+    /// **fitted (provisional).** What the datasheet gives: the LF353 slews at
+    /// 13 V/µs typical, 8 V/µs minimum (TI LF353 datasheet, Electrical
+    /// Characteristics, SR). Over the MC1408's ±2.5 V swing — 2.5 V per
+    /// full-scale unit — that is 13e6 / 2.5 ≈ 5.2e6 full-scale units per
+    /// second, two orders faster than the value here. The gap is not resolved:
+    /// which amplifier in the chain actually binds, and whether this field
+    /// stands for the rate signal or the integrator's own output, is a
+    /// schematic question this crate cannot answer. So the derived figure is
+    /// recorded and the shipped value stays fitted until the topology is
+    /// verified.
     pub slew_limit: f32,
     /// First-order settling once inside the slew limit, seconds.
+    ///
+    /// **fitted (provisional).** No paper source; small-signal settling
+    /// depends on the compensation and loading of the stage as built.
     pub settle_tau: f32,
     /// Sample-and-hold droop, seconds.
     ///
     /// Vectrex Y and Z are held on capacitors behind the CD4052 mux; X is
     /// driven straight from the DAC. That asymmetry is real and visible, so it
     /// is modelled rather than averaged away (ARCHITECTURE.md §5).
+    ///
+    /// **fitted (provisional).** Droop is hold-capacitor value divided by
+    /// total leakage — the mux's off-channel leakage plus the follower's bias
+    /// current. The capacitor value is schematic and unverified, so the rate
+    /// cannot be derived even though the CD4052's leakage is published.
     pub sh_droop_tau: f32,
     /// Integrator leak toward centre, seconds. Why absolute position is only
     /// trustworthy just after a ZERO recal.
+    ///
+    /// **fitted (provisional).** Set by the integrator capacitor's leakage and
+    /// the amplifier's input bias current in the as-built circuit.
     pub integrator_tau: f32,
     /// Z-axis (blanking) rise and fall, seconds.
+    ///
+    /// **fitted (provisional).** The Z chain's bandwidth is not published as a
+    /// single figure and the stage is schematic.
     pub z_tau: f32,
 }
 
 impl Constants {
     /// Vectrex: LF353 integrators, MC1408 DAC, CD4052 mux.
     ///
-    /// Provisional. These are the shape of the model, not fitted values — the
-    /// datasheet numbers belong here once the scripted-event rig can measure
-    /// against reference footage (ARCHITECTURE.md §6 step 2).
+    /// Provisional, and each field says how provisional. One value is
+    /// datasheet-derived and recorded as such but not adopted; the rest are
+    /// fitted or schematic-unverified, because deriving them needs the service
+    /// manual's component values and this crate has not seen it. They are the
+    /// shape of the model — the effects are in the right places and in the
+    /// right directions — not the Vectrex's numbers. ARCHITECTURE.md §4's
+    /// calibration path (reference footage, then a test-card ROM isolating one
+    /// parameter each) is how the fitted class is meant to shrink.
     pub fn vectrex() -> Self {
         Self {
             integrator_gain: 1.0,
