@@ -1,0 +1,12 @@
+[package]
+name = "vectrex"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+beam-rasteriser.workspace = true
+beam-trace.workspace = true
+m6809.workspace = true
