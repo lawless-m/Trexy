@@ -63,6 +63,26 @@ impl SubstepClock {
         self.steps = self.steps.max(steps);
     }
 
+    /// Renumber into a producer's fresh zero: every time this clock deals in
+    /// drops by `delta`.
+    ///
+    /// Sample `t` is f32, so its resolution decays as the number grows — the
+    /// ulp reaches a microsecond by t ≈ 8 s, and the producer emits samples a
+    /// microsecond apart. Counting from session start, timestamps stop being
+    /// distinguishable (TRACE-FORMAT.md §2, §5), so the producer periodically
+    /// re-origins its ring against a fresh epoch. This clock has to make the
+    /// same move or the two stop agreeing what "now" names, and the substep
+    /// windows chop against sample `t` directly.
+    ///
+    /// Both `origin` and `simulated()` shift; `steps` and `dt` do not, so the
+    /// grid keeps its spacing and stays counted rather than accumulated. It is
+    /// a renumbering, not a jump: no simulated time is gained or lost.
+    /// Nothing here touches the phosphor — it holds deposited energy, not
+    /// timestamps, and cannot tell that the clock was renumbered.
+    pub fn renumber(&mut self, delta: f64) {
+        self.origin -= delta;
+    }
+
     /// Every whole substep that completes at or before `now`.
     pub fn advance(&mut self, now: f64) -> Vec<Substep> {
         let mut out = Vec::new();
@@ -207,6 +227,76 @@ mod tests {
         let after = clock.advance(landed + SUBSTEP_SECONDS * 3.5);
         assert_eq!(after.len(), 3);
         assert_eq!(after[0].start, landed as f32);
+    }
+
+    #[test]
+    fn renumbering_moves_every_time_the_clock_deals_in() {
+        let mut clock = SubstepClock::new(0.0);
+        clock.advance(1.0);
+        let before = clock.simulated();
+
+        clock.renumber(0.9);
+
+        // The producer's zero moved forward by 0.9, so everything here drops
+        // by 0.9 — that is what puts both sides in one numbering.
+        assert!((clock.simulated() - (before - 0.9)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn renumbering_is_not_a_jump_in_simulated_time() {
+        let mut clock = SubstepClock::new(0.0);
+        clock.advance(1.0);
+        let steps_before = clock.advance(clock.simulated()).len();
+
+        clock.renumber(0.9);
+
+        // No substep is gained or lost: the numbers move, the grid does not.
+        assert_eq!(steps_before, 0);
+        assert_eq!(clock.advance(clock.simulated()).len(), 0);
+        assert_eq!(clock.advance(clock.simulated() + 3.0 * clock.dt()).len(), 3);
+    }
+
+    #[test]
+    fn renumbering_leaves_the_grid_spacing_alone() {
+        let mut clock = SubstepClock::new(0.0);
+        clock.advance(1.0);
+        clock.renumber(0.9);
+
+        let steps = clock.advance(clock.simulated() + 10.0 * clock.dt());
+        assert_eq!(steps.len(), 10);
+        for pair in steps.windows(2) {
+            assert!(
+                (pair[1].start - pair[0].end).abs() < 1e-6,
+                "{} did not abut {}",
+                pair[1].start,
+                pair[0].end
+            );
+        }
+        for step in &steps {
+            assert!((f64::from(step.end - step.start) - clock.dt()).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn renumbering_repeatedly_keeps_the_clock_near_its_zero() {
+        // What this exists for: a session long enough that f32 sample `t`
+        // would lose its microsecond resolution, walked in renumbered hops so
+        // the numbers on both sides stay small.
+        let mut clock = SubstepClock::new(0.0);
+        let mut walked = 0.0;
+        for _ in 0..64 {
+            let before = clock.simulated();
+            clock.advance(before + 1.0);
+            let delta = clock.simulated() - before;
+            walked += delta;
+            clock.renumber(clock.simulated());
+            assert!(
+                clock.simulated().abs() < clock.dt(),
+                "clock should sit at its fresh zero, not {}",
+                clock.simulated()
+            );
+        }
+        assert!(walked > 60.0, "expected to have walked a real interval");
     }
 
     #[test]

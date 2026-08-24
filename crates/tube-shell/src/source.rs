@@ -27,6 +27,17 @@ const IDLE: Duration = Duration::from_millis(2);
 /// density the renderer targets.
 const CAPACITY: usize = beam_trace::DEFAULT_CAPACITY;
 
+/// Ring time after which the producer re-origins against a fresh epoch.
+///
+/// `t` is f32, so its resolution decays as the number grows: the ulp reaches
+/// 0.48 µs at 4 s, 0.95 µs at 8 s and 1.9 µs at 16 s, while the finest spacing
+/// emitted is a microsecond (`beam_sources` brackets drive steps over 1 µs).
+/// Four seconds keeps the ulp at half that spacing with room to spare. Left
+/// counting from session start the timestamps collapse, window queries starve,
+/// and the shell reports "0 samples this frame" — which is what a session left
+/// running a few hours actually did (TRACE-FORMAT.md §2, §5).
+const REORIGIN_SECONDS: f64 = 4.0;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source {
     /// The general figure, with everything on a slider.
@@ -146,10 +157,20 @@ impl LiveSource {
         }
     }
 
-    /// Seconds since the source started. This is the renderer's `T_now`, and
-    /// the producer's timestamps are against the same origin.
+    /// Seconds since the ring's current epoch. This is the renderer's `T_now`,
+    /// and the producer's timestamps are against the same origin — which moves
+    /// periodically so neither side ever counts far enough for f32 `t` to lose
+    /// its resolution. Pair it with [`Self::epoch`] to notice when it moved.
     pub fn elapsed(&self) -> f64 {
-        self.start.elapsed().as_secs_f64()
+        let epoch = self.ring.lock().expect("ring lock").epoch();
+        self.start.elapsed().as_secs_f64() - epoch
+    }
+
+    /// Session time the ring's `t` is currently measured from. It steps
+    /// forward whenever the producer re-origins; a consumer that keeps its own
+    /// clock must move it by the same delta.
+    pub fn epoch(&self) -> f64 {
+        self.ring.lock().expect("ring lock").epoch()
     }
 
     pub fn controls(&self) -> Controls {
@@ -356,7 +377,22 @@ fn produce(
         }
 
         let mut ring = ring.lock().expect("ring lock");
+
+        // Re-origin *before* writing, never after. A timestamp written out
+        // where the ulp exceeds the sample spacing has already collapsed, and
+        // shifting it afterwards moves identical numbers to identical numbers
+        // — the loss is at the moment of writing.
+        if now - ring.epoch() > REORIGIN_SECONDS {
+            let delta = (now - ring.epoch()) as f32;
+            ring.reorigin(now);
+            last_t -= delta;
+        }
+        let epoch = ring.epoch() as f32;
+
         for mut sample in chunk {
+            // Chunks are timestamped in session time; the ring counts from its
+            // epoch.
+            sample.t -= epoch;
             // Chunks abut, so the first sample of one lands on the last of the
             // previous. `t` must strictly increase (TRACE-FORMAT.md §2) and the
             // duplicate carries no new information, so nudge it.
@@ -499,6 +535,81 @@ mod tests {
 
     /// Long enough for the producer to get several chunks ahead of the clock.
     const SETTLE: Duration = Duration::from_millis(150);
+
+    /// The producer's re-origin rule, applied to a ring the same way
+    /// `produce` applies it. Driven directly rather than by sleeping through a
+    /// session, which is the only practical way to walk hours of clock.
+    fn write_chunk(ring: &mut RingBuffer, now: f64, last_t: &mut f32, spacing: f32) {
+        if now - ring.epoch() > REORIGIN_SECONDS {
+            let delta = (now - ring.epoch()) as f32;
+            ring.reorigin(now);
+            *last_t -= delta;
+        }
+        let epoch = ring.epoch() as f32;
+        for i in 0..8 {
+            let mut sample = Sample {
+                t: (now as f32) + i as f32 * spacing,
+                ..Sample::default()
+            };
+            sample.t -= epoch;
+            if sample.t <= *last_t {
+                sample.t = f32::from_bits(last_t.to_bits() + 1);
+            }
+            *last_t = sample.t;
+            ring.push(sample);
+        }
+    }
+
+    #[test]
+    fn timestamps_stay_small_across_a_long_session() {
+        let mut ring = RingBuffer::with_capacity(1024, 0.0);
+        let mut last_t = f32::NEG_INFINITY;
+
+        // Four hours, the length at which a real session reported
+        // "0 samples this frame".
+        let mut now = 0.0f64;
+        let mut worst = 0.0f32;
+        while now < 4.0 * 3600.0 {
+            write_chunk(&mut ring, now, &mut last_t, 1e-6);
+            worst = worst.max(last_t.abs());
+            now += 0.02;
+        }
+
+        // Small enough that the f32 ulp stays under the 1 us spacing emitted.
+        assert!(
+            worst < REORIGIN_SECONDS as f32 + 1.0,
+            "timestamps reached {worst} s over a four-hour session"
+        );
+        let ulp = f32::from_bits(worst.to_bits() + 1) - worst;
+        assert!(ulp < 1e-6, "ulp at {worst} s is {ulp} s, coarser than 1 us");
+    }
+
+    #[test]
+    fn a_long_session_keeps_microsecond_spaced_samples_distinct() {
+        let mut ring = RingBuffer::with_capacity(1024, 0.0);
+        let mut last_t = f32::NEG_INFINITY;
+
+        let mut now = 0.0f64;
+        while now < 3600.0 {
+            write_chunk(&mut ring, now, &mut last_t, 1e-6);
+            now += 0.02;
+        }
+
+        // The samples the ring still holds must be separable, which is exactly
+        // what a starved window query proved they were not.
+        let (a, b) = ring.samples_in(f32::NEG_INFINITY, f32::INFINITY);
+        let held: Vec<f32> = a.iter().chain(b.iter()).map(|s| s.t).collect();
+        assert!(held.len() > 100);
+        for pair in held.windows(2) {
+            assert!(
+                pair[1] > pair[0],
+                "{} did not exceed {} after an hour",
+                pair[1],
+                pair[0]
+            );
+        }
+    }
+
 
     fn at(t: f32) -> Sample {
         Sample::mono(t.sin(), t.cos(), 1.0, t)

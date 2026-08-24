@@ -86,6 +86,11 @@ struct Gpu {
     /// What the current buffers were built with, so a structural change is
     /// noticed and rebuilt rather than silently ignored.
     built_with: TubeParams,
+    /// Session time the ring's timestamps were last measured from. The
+    /// producer moves it periodically so f32 `t` never counts far enough to
+    /// lose resolution; the field's clock has to make the same move or the two
+    /// stop agreeing what "now" names.
+    source_epoch: f64,
     /// Display rows the field was built for. The window is the display here,
     /// so this follows it — a field frozen at the headless height renders a
     /// small picture and lets the swapchain magnify it, which reads as visible
@@ -342,6 +347,7 @@ impl Gpu {
             skipped_seconds: 0.0,
             params: TubeParams::default(),
             built_with: TubeParams::default(),
+            source_epoch: 0.0,
             // Zero forces the first rebuild to size the field to the window.
             field_height: 0,
             profile_status: String::new(),
@@ -621,6 +627,13 @@ impl Gpu {
             rendered.field.set_params(params);
             // Ask the ring buffer for everything since the field last caught
             // up, and let the substep loop chop it (TRACE-FORMAT.md §5).
+            // Follow the producer's epoch before reading the clock: sample
+            // `t` is measured from it, and it moves.
+            let epoch = source.epoch();
+            if epoch != self.source_epoch {
+                rendered.field.renumber(epoch - self.source_epoch);
+                self.source_epoch = epoch;
+            }
             let now = source.elapsed();
             let window = source.window(rendered.field.simulated() as f32, now as f32);
             rendered

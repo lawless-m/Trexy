@@ -84,6 +84,36 @@ impl RingBuffer {
         self.generation += 1;
     }
 
+    /// Re-origin against `epoch`, carrying the live samples across.
+    ///
+    /// The reason this exists: `t` is f32, so its resolution decays as the
+    /// number grows — the ulp reaches a microsecond at t ≈ 8 s, and the
+    /// producer emits samples a microsecond apart. Left counting from session
+    /// start, timestamps stop being distinguishable and a window query starves
+    /// (TRACE-FORMAT.md §2, §5). Re-origining periodically keeps `t` small
+    /// enough to stay exact.
+    ///
+    /// Unlike [`Self::rebase`] this keeps what the buffer holds, shifting each
+    /// `t` by the same amount. That matters in the live path: the ring carries
+    /// both the phosphor's recent history and the producer's lookahead, and
+    /// dropping either leaves a gap in deposition — a visible dimming every
+    /// time the clock is renumbered, which would be a worse fault than the one
+    /// being fixed.
+    ///
+    /// Consumers must move their own clock by the same delta; the generation
+    /// bump is how they notice. `t` from different generations is not
+    /// comparable.
+    pub fn reorigin(&mut self, epoch: f64) {
+        let delta = (epoch - self.epoch) as f32;
+        let capacity = self.capacity();
+        for offset in 0..self.len {
+            let slot = (self.head + offset) % capacity;
+            self.samples[slot].t -= delta;
+        }
+        self.epoch = epoch;
+        self.generation += 1;
+    }
+
     /// Append one sample, dropping the oldest if the buffer is full.
     pub fn push(&mut self, sample: Sample) {
         let capacity = self.capacity();
@@ -188,6 +218,57 @@ mod tests {
         assert_eq!(window(&ring, 5.0, 9.0), Vec::<f32>::new());
         assert_eq!(window(&ring, 4.0, 4.0), Vec::<f32>::new());
         assert_eq!(window(&ring, 0.5, 1.0), vec![1.0]);
+    }
+
+    #[test]
+    fn re_origining_carries_the_samples_across() {
+        let mut ring = RingBuffer::with_capacity(8, 100.0);
+        ring.extend(&[at(1.0), at(2.0), at(3.0)]);
+
+        ring.reorigin(102.0);
+
+        // Same instants, renumbered against the new zero: nothing dropped and
+        // nothing moved in real time.
+        assert_eq!(ring.len(), 3);
+        assert_eq!(window(&ring, -2.0, 5.0), vec![-1.0, 0.0, 1.0]);
+        assert_eq!(ring.epoch(), 102.0);
+        assert_eq!(ring.generation(), 1);
+    }
+
+    #[test]
+    fn re_origining_across_the_wrap_point_moves_every_live_sample() {
+        let mut ring = RingBuffer::with_capacity(4, 0.0);
+        // Six pushes into four slots leaves the live samples straddling the
+        // wrap, which is the case a naive loop over the backing array misses.
+        ring.extend(&[at(1.0), at(2.0), at(3.0), at(4.0), at(5.0), at(6.0)]);
+
+        ring.reorigin(3.0);
+
+        assert_eq!(window(&ring, -1.0, 10.0), vec![0.0, 1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn re_origining_prevents_a_collapse_it_cannot_undo() {
+        // At t ≈ 12600 s — a session left running a few hours — the f32 ulp is
+        // ~1 ms, so instants a microsecond apart cannot be told apart.
+        let far = 12_600.0f32;
+        assert_eq!(far + 1e-6, far, "premise: 1 us is below the ulp out here");
+
+        // Counting from session start, three distinct instants are written as
+        // one value. The information is lost at the moment of writing, and
+        // re-origining afterwards moves three identical numbers to three
+        // identical numbers — it cannot bring back what was never stored.
+        let mut late = RingBuffer::with_capacity(8, 0.0);
+        late.extend(&[at(far), at(far + 1e-6), at(far + 2e-6)]);
+        late.reorigin(f64::from(far));
+        assert_eq!(window(&late, -1.0, 1.0), vec![0.0, 0.0, 0.0]);
+
+        // Re-origined *before* they are written, the same three instants stay
+        // distinct. That is why the producer must do this periodically rather
+        // than once trouble shows.
+        let mut kept = RingBuffer::with_capacity(8, f64::from(far));
+        kept.extend(&[at(0.0), at(1e-6), at(2e-6)]);
+        assert_eq!(window(&kept, -1.0, 1.0), vec![0.0, 1e-6, 2e-6]);
     }
 
     #[test]

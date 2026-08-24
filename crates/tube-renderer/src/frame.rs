@@ -207,6 +207,13 @@ impl Field {
         self.clock.simulated()
     }
 
+    /// Renumber into a producer's fresh zero — see
+    /// [`crate::substep::SubstepClock::renumber`]. Costs nothing and changes
+    /// no pixel.
+    pub fn renumber(&mut self, delta: f64) {
+        self.clock.renumber(delta);
+    }
+
     /// Simulated time the last advance threw away rather than catching up on.
     /// Non-zero means the renderer could not keep pace, and the panel says so
     /// rather than letting it pass unnoticed.
