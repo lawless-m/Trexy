@@ -45,3 +45,9 @@ bytemuck = { version = "1.25", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 toml = "1.1"
+
+# The rasteriser's tests walk millions of integration steps each.
+# Unoptimised that is minutes; optimised it is seconds, and a gate nobody
+# waits for is a gate nobody runs.
+[profile.test.package.beam-rasteriser]
+opt-level = 2

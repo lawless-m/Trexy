@@ -275,6 +275,16 @@ impl Rasteriser {
         let mut anchor = (self.state.x, self.state.y);
         let mut anchor_drive = self.state.drive;
         while self.now < t {
+            // Try the closed form each time round, not once on entry: a
+            // transient — a converter still settling, a drive edge — blocks it
+            // briefly, and the ramp behind that transient is exactly what it
+            // exists to skip. Attempting it only before the loop means one
+            // moment of transient costs the whole ramp.
+            if self.fast_forward_slew(t, out) {
+                anchor = (self.state.x, self.state.y);
+                anchor_drive = self.state.drive;
+                continue;
+            }
             let dt = STEP_SECONDS.min(t - self.now);
             self.step(dt as f32);
             self.now += dt;
@@ -292,6 +302,106 @@ impl Rasteriser {
             }
         }
         self.emit(out);
+    }
+
+    /// Advance a pure slew in closed form instead of walking it.
+    ///
+    /// While the amplifier is slew-limited the rate is a linear ramp, so
+    /// position is quadratic and both have exact sums — a 10 ms slew is one
+    /// calculation rather than forty thousand steps (ARCHITECTURE.md §2:
+    /// "analytic fast-forward through steady ramps ... numerical stepping is
+    /// only needed around events and high curvature").
+    ///
+    /// What is summed is the *stepper's* arithmetic, not the idealised
+    /// integral. `step` advances position by the post-step rate, which is a
+    /// first-order approximation; reproducing the exact integral here instead
+    /// would make the fast and slow paths disagree by an accumulated bias, and
+    /// the error bound is checked against a densely-stepped reference. Summing
+    /// what stepping would have produced keeps one answer whichever path runs.
+    ///
+    /// Returns false when the state is not a pure slew, leaving the caller to
+    /// step: droop, leak and the Z rise are exponentials that interact, and a
+    /// combined closed form for those buys nothing — they settle in a bounded
+    /// handful of time constants, whereas a slew grows without bound as the
+    /// limit falls.
+    fn fast_forward_slew(&mut self, until: f64, out: &mut Vec<Sample>) -> bool {
+        let c = self.constants;
+        if c.sh_droop_tau.is_finite()
+            || c.integrator_tau.is_finite()
+            || c.settle_tau > 0.0
+            || self.state.drive != self.want_drive
+            || !c.slew_limit.is_finite()
+            // While the converter is still settling the slew target is moving,
+            // so the ramp is not steady and there is nothing to fast-forward.
+            // Once it has arrived the fast path applies as before.
+            || (self.state.dac_x - self.want_rx).abs() > 1e-6
+            || (self.state.dac_y - self.state.hold_ry).abs() > 1e-6
+        {
+            return false;
+        }
+
+        let dt = STEP_SECONDS as f32;
+        let per_step = c.slew_limit * dt;
+        if per_step <= 0.0 {
+            return false;
+        }
+
+        let mut ran = false;
+        loop {
+            let (rx, ry) = (self.state.rx, self.state.ry);
+            let (dx, dy) = (self.want_rx - rx, self.state.hold_ry - ry);
+            if dx.abs() <= per_step && dy.abs() <= per_step {
+                return ran; // no longer slewing; the caller settles it
+            }
+
+            // Steps this regime lasts: whichever axis reaches its target first.
+            let until_target = |d: f32| {
+                if d.abs() > per_step {
+                    (d.abs() / per_step).floor() as u64
+                } else {
+                    u64::MAX
+                }
+            };
+            let regime = until_target(dx).min(until_target(dy));
+
+            // Steps left before `until`.
+            let remaining = ((until - self.now) / STEP_SECONDS).floor();
+            if remaining < 1.0 {
+                return ran;
+            }
+
+            // Steps the error bound allows: position is quadratic in time, so
+            // its departure from the chord over T is |a|T²/4 with a = s·gain/2.
+            let sx = if dx.abs() > per_step { c.slew_limit * dx.signum() } else { 0.0 };
+            let sy = if dy.abs() > per_step { c.slew_limit * dy.signum() } else { 0.0 };
+            let accel = 0.5 * c.integrator_gain * (sx * sx + sy * sy).sqrt();
+            let span = if accel > 0.0 {
+                (4.0 * self.epsilon / accel).sqrt()
+            } else {
+                f32::INFINITY
+            };
+            let bound = (f64::from(span) / STEP_SECONDS).floor().max(1.0);
+
+            let n = regime.min(remaining as u64).min(bound as u64).max(1);
+            let nf = n as f32;
+
+            // r_k = r0 + k·s·dt, so Σ r_k = n·r0 + s·dt·n(n+1)/2.
+            let advance = |r0: f32, s: f32| -> (f32, f32) {
+                let sum = nf * r0 + s * dt * nf * (nf + 1.0) * 0.5;
+                (r0 + nf * s * dt, sum * c.integrator_gain * dt)
+            };
+            let (rx_end, x_moved) = advance(rx, sx);
+            let (ry_end, y_moved) = advance(ry, sy);
+
+            self.state.rx = rx_end;
+            self.state.ry = ry_end;
+            self.state.x += x_moved;
+            self.state.y += y_moved;
+            self.now += n as f64 * STEP_SECONDS;
+            self.since_anchor.clear();
+            self.emit(out);
+            ran = true;
+        }
     }
 
     /// Nothing left to converge: rates are at their commanded values, the
@@ -634,6 +744,79 @@ mod tests {
         assert!(
             out.iter().any(|s| s.drive_r > 0.01 && s.drive_r < 0.99),
             "no partial drive found across the Z rise"
+        );
+    }
+
+    #[test]
+    fn a_long_slew_is_summed_rather_than_walked() {
+        // A slow amplifier: 10 ms to cross the rate range, which at the
+        // 2.5e-7 s step is forty thousand steps to walk.
+        let mut c = Constants::ideal();
+        c.slew_limit = 100.0;
+        let events = [Event::Rate { t: 0.0, rx: 1.0, ry: 0.0 }];
+        let out = run(c, &events, 1.0e-2);
+
+        let stepped = 1.0e-2 / super::STEP_SECONDS;
+        assert!(
+            (out.len() as f64) < stepped / 100.0,
+            "expected the closed form, but {} samples looks like walking {stepped:.0} steps",
+            out.len()
+        );
+
+        // And it must still be the same curve. Re-walk it densely and check
+        // the emitted polyline never strays further than the bound allows.
+        let mut fine = Rasteriser::new(c, 1.0e-9);
+        let mut dense = Vec::new();
+        fine.push(events[0], &mut dense);
+        fine.run_to(1.0e-2, &mut dense);
+
+        let mut worst = 0.0f32;
+        for d in &dense {
+            let mut best = f32::MAX;
+            for seg in out.windows(2) {
+                let (ax, ay, bx, by) = (seg[0].x, seg[0].y, seg[1].x, seg[1].y);
+                let (vx, vy) = (bx - ax, by - ay);
+                let len2 = vx * vx + vy * vy;
+                let f = if len2 <= 0.0 {
+                    0.0
+                } else {
+                    (((d.x - ax) * vx + (d.y - ay) * vy) / len2).clamp(0.0, 1.0)
+                };
+                best = best.min(((d.x - (ax + vx * f)).powi(2) + (d.y - (ay + vy * f)).powi(2)).sqrt());
+            }
+            worst = worst.max(best);
+        }
+        assert!(worst <= EPS * 2.0, "summed slew strays {worst}, bound {EPS}");
+    }
+
+    #[test]
+    fn summing_a_slew_lands_where_walking_it_lands() {
+        // The closed form is the stepper's own arithmetic, so the two paths
+        // must agree — otherwise the answer would depend on which ran.
+        let mut c = Constants::ideal();
+        c.slew_limit = 100.0;
+
+        let mut fast = Rasteriser::new(c, EPS);
+        let mut out = Vec::new();
+        fast.push(Event::Rate { t: 0.0, rx: 1.0, ry: 0.5 }, &mut out);
+        fast.run_to(5.0e-3, &mut out);
+
+        // Force the stepping path by denying the fast one its preconditions,
+        // then compare where the beam ended up.
+        let mut walked = Rasteriser::new(c, EPS);
+        let mut ignored = Vec::new();
+        walked.push(Event::Rate { t: 0.0, rx: 1.0, ry: 0.5 }, &mut ignored);
+        while walked.now < 5.0e-3 {
+            let dt = super::STEP_SECONDS.min(5.0e-3 - walked.now);
+            walked.step(dt as f32);
+            walked.now += dt;
+        }
+
+        let (fx, fy) = fast.position();
+        let (wx, wy) = walked.position();
+        assert!(
+            (fx - wx).abs() < 1e-6 && (fy - wy).abs() < 1e-6,
+            "summed ({fx}, {fy}) but walked ({wx}, {wy})"
         );
     }
 
