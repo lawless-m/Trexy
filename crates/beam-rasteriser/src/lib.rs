@@ -76,6 +76,17 @@ pub struct Constants {
     /// **fitted (provisional).** The Z chain's bandwidth is not published as a
     /// single figure and the stage is schematic.
     pub z_tau: f32,
+    /// DAC settling, seconds.
+    ///
+    /// A code written to the converter does not appear at its output
+    /// instantly, so the amplifier chases a moving target for a moment after
+    /// every rewrite rather than the final value (ARCHITECTURE.md §2, "DAC
+    /// settling glitch"). Zero means instantaneous.
+    ///
+    /// **fitted (provisional).** ~300 ns is the figure usually quoted for the
+    /// MC1408, but the datasheet obtainable here is a scan with no text layer,
+    /// so it is not cited — an unread source is not a source.
+    pub dac_settle_tau: f32,
 }
 
 impl Constants {
@@ -97,6 +108,8 @@ impl Constants {
             sh_droop_tau: 5.0e-3,
             integrator_tau: 0.5,
             z_tau: 5.0e-7,
+            // MC1408: ~300 ns to settle within ±1/2 LSB, per the datasheet.
+            dac_settle_tau: 3.0e-7,
         }
     }
 
@@ -110,6 +123,7 @@ impl Constants {
             sh_droop_tau: f32::INFINITY,
             integrator_tau: f32::INFINITY,
             z_tau: 0.0,
+            dac_settle_tau: 0.0,
         }
     }
 }
@@ -143,6 +157,10 @@ struct State {
     /// Rate actually reaching the integrators, after slew and droop.
     rx: f32,
     ry: f32,
+    /// What the converter is actually presenting, as distinct from the code
+    /// last written to it. The amplifier chases this, not the command.
+    dac_x: f32,
+    dac_y: f32,
     /// The voltage on the Y sample-and-hold capacitor. Latched when the
     /// machine writes it and drooping from then on — unlike X, which the DAC
     /// drives continuously, so it has no held value to decay
@@ -186,7 +204,16 @@ impl Rasteriser {
             epsilon,
             want_rx: 0.0,
             want_drive: [0.0; 3],
-            state: State { x: 0.0, y: 0.0, rx: 0.0, ry: 0.0, hold_ry: 0.0, drive: [0.0; 3] },
+            state: State {
+                x: 0.0,
+                y: 0.0,
+                rx: 0.0,
+                ry: 0.0,
+                dac_x: 0.0,
+                dac_y: 0.0,
+                hold_ry: 0.0,
+                drive: [0.0; 3],
+            },
             now: 0.0,
             pending_break: false,
             started: false,
@@ -272,7 +299,10 @@ impl Rasteriser {
     /// the beam by more than the error bound over a typical stroke.
     fn is_settled(&self) -> bool {
         let c = &self.constants;
-        let rate_ok = (self.state.rx - self.want_rx).abs() < 1e-6
+        let dac_ok = (self.state.dac_x - self.want_rx).abs() < 1e-6
+            && (self.state.dac_y - self.state.hold_ry).abs() < 1e-6;
+        let rate_ok = dac_ok
+            && (self.state.rx - self.want_rx).abs() < 1e-6
             && (self.state.ry - self.state.hold_ry).abs() < 1e-6;
         let drive_ok = (0..3).all(|i| (self.state.drive[i] - self.want_drive[i]).abs() < 1e-6);
         let droop_ok = !c.sh_droop_tau.is_finite() || self.state.hold_ry.abs() < 1e-9;
@@ -348,8 +378,22 @@ impl Rasteriser {
         if c.sh_droop_tau.is_finite() && c.sh_droop_tau > 0.0 {
             self.state.hold_ry *= (-dt / c.sh_droop_tau).exp();
         }
-        self.state.rx = approach(self.state.rx, self.want_rx);
-        self.state.ry = approach(self.state.ry, self.state.hold_ry);
+
+        // The converter settles toward the code written to it, so for a moment
+        // after each rewrite the amplifier is chasing a value that is itself
+        // still moving. This sits ahead of the slew stage because that is where
+        // it sits in the circuit.
+        if c.dac_settle_tau > 0.0 {
+            let closed = 1.0 - (-dt / c.dac_settle_tau).exp();
+            self.state.dac_x += (self.want_rx - self.state.dac_x) * closed;
+            self.state.dac_y += (self.state.hold_ry - self.state.dac_y) * closed;
+        } else {
+            self.state.dac_x = self.want_rx;
+            self.state.dac_y = self.state.hold_ry;
+        }
+
+        self.state.rx = approach(self.state.rx, self.state.dac_x);
+        self.state.ry = approach(self.state.ry, self.state.dac_y);
 
         // Integrate rate into position.
         self.state.x += self.state.rx * c.integrator_gain * dt;
@@ -591,6 +635,84 @@ mod tests {
             out.iter().any(|s| s.drive_r > 0.01 && s.drive_r < 0.99),
             "no partial drive found across the Z rise"
         );
+    }
+
+    #[test]
+    fn a_settling_converter_bends_the_stroke_then_rejoins_it() {
+        // A rewrite mid-ramp: the amplifier chases a target that is itself
+        // still moving, so the beam departs from where an instant converter
+        // would have put it, then rejoins once the code has arrived.
+        let events = [
+            Event::Rate { t: 0.0, rx: 1.0, ry: 0.0 },
+            Event::Rate { t: 5.0e-6, rx: -1.0, ry: 0.0 },
+        ];
+        let tau = 1.0e-6;
+
+        let instant = run(Constants::ideal(), &events, 3.0e-5);
+        let mut settling = Constants::ideal();
+        settling.dac_settle_tau = tau;
+        let settled = run(settling, &events, 3.0e-5);
+
+        let at = |s: &[Sample], t: f32| {
+            s.windows(2)
+                .find(|w| w[0].t <= t && t <= w[1].t)
+                .map(|w| {
+                    let f = if w[1].t > w[0].t { (t - w[0].t) / (w[1].t - w[0].t) } else { 0.0 };
+                    w[0].x + (w[1].x - w[0].x) * f
+                })
+                .unwrap_or_else(|| s.last().expect("samples").x)
+        };
+
+        // Just after the rewrite the two disagree...
+        let near = (at(&settled, 6.0e-6) - at(&instant, 6.0e-6)).abs();
+        assert!(near > 1.0e-7, "no departure at the rewrite: {near}");
+
+        // ...and a few time constants later they are travelling together
+        // again, the difference frozen at whatever the glitch cost.
+        let a = (at(&settled, 2.0e-5) - at(&instant, 2.0e-5)).abs();
+        let b = (at(&settled, 3.0e-5) - at(&instant, 3.0e-5)).abs();
+        assert!(
+            (a - b).abs() < near,
+            "still diverging {} s after the rewrite: {a} then {b}",
+            2.0e-5 - 5.0e-6
+        );
+    }
+
+    #[test]
+    fn the_error_bound_holds_with_a_settling_converter() {
+        let mut c = Constants::ideal();
+        c.dac_settle_tau = 1.0e-6;
+        c.slew_limit = 1.0e4;
+        let events = [
+            Event::Rate { t: 0.0, rx: 1.0, ry: 0.0 },
+            Event::Rate { t: 1.0e-4, rx: 0.0, ry: 1.0 },
+        ];
+        let out = run(c, &events, 3.0e-4);
+
+        let mut fine = Rasteriser::new(c, 1.0e-9);
+        let mut dense = Vec::new();
+        for e in &events {
+            fine.push(*e, &mut dense);
+        }
+        fine.run_to(3.0e-4, &mut dense);
+
+        let mut worst = 0.0f32;
+        for d in &dense {
+            let mut best = f32::MAX;
+            for seg in out.windows(2) {
+                let (ax, ay, bx, by) = (seg[0].x, seg[0].y, seg[1].x, seg[1].y);
+                let (vx, vy) = (bx - ax, by - ay);
+                let len2 = vx * vx + vy * vy;
+                let f = if len2 <= 0.0 {
+                    0.0
+                } else {
+                    (((d.x - ax) * vx + (d.y - ay) * vy) / len2).clamp(0.0, 1.0)
+                };
+                best = best.min(((d.x - (ax + vx * f)).powi(2) + (d.y - (ay + vy * f)).powi(2)).sqrt());
+            }
+            worst = worst.max(best);
+        }
+        assert!(worst <= EPS * 2.0, "strays {worst} with the converter settling, bound {EPS}");
     }
 
     #[test]
