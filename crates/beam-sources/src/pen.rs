@@ -114,11 +114,21 @@ impl Pen {
         let from = self.at;
         let total = ((to[0] - from[0]).powi(2) + (to[1] - from[1]).powi(2)).sqrt();
 
+        if total <= 0.0 {
+            // Nowhere to move, so the drive change is the whole event and
+            // `set_drive` is the whole of it. Falling through would travel zero
+            // distance and push a second sample carrying nothing new — one
+            // event recorded twice. With the drive unchanged as well, nothing
+            // happened at all and nothing is emitted.
+            self.set_drive(drive);
+            return;
+        }
+
         if drive != self.drive {
-            if total <= 0.0 || drive == [0.0; 3] {
-                // Nowhere to move, or the gun is cutting out: blanking belongs
-                // at the end of the lit path, so the drive falls while the beam
-                // is still at `from` and only then does it fly away dark.
+            if drive == [0.0; 3] {
+                // The gun is cutting out: blanking belongs at the end of the
+                // lit path, so the drive falls while the beam is still at
+                // `from` and only then does it fly away dark.
                 //
                 // Riding the start of the sweep here instead — symmetrically
                 // with unblanking below — budgets the transition in time, and
@@ -274,6 +284,31 @@ mod tests {
         pen.stroke([1.0, 0.0], [1.0; 3], 100.0);
         // Start, the bracketed drive step, and the end.
         assert_eq!(pen.samples().len(), 3);
+    }
+
+    #[test]
+    fn blanking_without_moving_emits_one_sample() {
+        let mut pen = Pen::new([0.25, -0.25], EPSILON);
+        pen.set_drive([1.0; 3]);
+        let before = pen.samples().len();
+
+        // Cut the gun where the beam already is. That is one event, so it is
+        // one sample: the drive change. The move has nowhere to go.
+        pen.stroke([0.25, -0.25], [0.0; 3], 500.0);
+
+        assert_eq!(
+            pen.samples().len() - before,
+            1,
+            "blanking in place should add the drive change and nothing else"
+        );
+
+        // Asserting the pair are not byte-identical would prove nothing: `push`
+        // nudges a colliding `t` by one ulp to hold the strictly-increasing
+        // invariant, so a redundant sample arrives wearing a different
+        // timestamp. Count is what distinguishes one event from two.
+        for pair in pen.samples().windows(2) {
+            assert!(pair[1].t > pair[0].t, "{} did not exceed {}", pair[1].t, pair[0].t);
+        }
     }
 
     #[test]
