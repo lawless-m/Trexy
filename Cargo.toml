@@ -15,6 +15,7 @@ beam-trace = { path = "crates/beam-trace" }
 tube-renderer = { path = "crates/tube-renderer" }
 beam-sources = { path = "crates/beam-sources" }
 beam-rasteriser = { path = "crates/beam-rasteriser" }
+m6809 = { path = "crates/m6809" }
 
 # Graphics. Native Linux only, Vulkan primary, WGSL against the WebGPU feature
 # set. No WebGL2 path anywhere (ARCHITECTURE.md §7), hence egui-wgpu's default
@@ -46,8 +47,11 @@ serde = { version = "1.0", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 toml = "1.1"
 
-# The rasteriser's tests walk millions of integration steps each.
-# Unoptimised that is minutes; optimised it is seconds, and a gate nobody
-# waits for is a gate nobody runs.
+# The emulator's tests run millions of machine cycles each. Unoptimised that
+# is minutes; optimised it is seconds, and a gate nobody waits for is a gate
+# nobody runs.
+[profile.test.package.m6809]
+opt-level = 2
+
 [profile.test.package.beam-rasteriser]
 opt-level = 2
