@@ -78,9 +78,6 @@ const PI: f32 = 3.14159265358979;
 const SQRT_PI_OVER_2: f32 = 1.25331413731550;
 const SQRT_2: f32 = 1.41421356237310;
 
-// Gaussian support cutoff, in σ. Beyond 4σ the kernel is below 3e-4 of peak.
-const CUTOFF_SIGMAS: f32 = 4.0;
-
 // TRACE-FORMAT.md §3.
 const DISCONTINUITY: u32 = 1u;
 

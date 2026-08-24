@@ -13,7 +13,8 @@ use wgpu::util::DeviceExt;
 /// (RENDERER.md §1).
 pub const SUPERSAMPLE: u32 = 2;
 
-/// Gaussian support cutoff in σ; must match `CUTOFF_SIGMAS` in deposit.wgsl.
+/// Gaussian support cutoff in σ. Beyond 4σ the kernel is below 3e-4 of
+/// peak, so the dispatch's bounding box stops there.
 const CUTOFF_SIGMAS: f32 = 4.0;
 
 /// Dynamic uniform offsets must be a multiple of this.
